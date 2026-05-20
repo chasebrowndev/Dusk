@@ -32,19 +32,28 @@ dusk --server 100.x.y.z:7667 --nick yourname
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Alt+Up` / `Alt+Down` | Switch rooms |
-| `Esc` or `Ctrl+C` | Quit |
+| `Shift+Enter` or `Alt+Enter` | Insert a newline |
+| `← / → / ↑ / ↓` | Move cursor through typed text |
+| `Page Up` / `Page Down` | Scroll message history |
+| `Tab` | Focus room sidebar (`Enter` joins, `Esc` returns) |
+| `v` | Toggle voice (when input is empty) |
+| `Ctrl+C` | Quit |
 | `/join <room>` or `/j <room>` | Join a room |
 | `/create <name>` or `/new <name>` | Create a room |
 | `/rooms` or `/list` | Refresh room list |
+| `/theme [name]` | Switch theme, or list all themes |
+| `/share [cam]` or `/share stop` | Share screen (or camera) over Tailscale |
+| `/watch [nick]` | Open a peer's shared stream |
 
 ## Protocol Rules
 
 - Clients must send `Join` before any other message
 - Server sanitizes room names: lowercase alphanum + `-_`, max 32 chars, strips leading `#`
 - Server broadcasts `UserJoined` / `UserLeft` to the room on connect/disconnect
+- `Joined`, `SwitchedRoom`, `UserJoined`, `UserLeft` all carry the room's current `users` list
 - Server sends `Joined` (with history) on initial join and `RoomList` after join
 - Server sends `SwitchedRoom` (with history) when client switches rooms
+- `ShareStart` / `ShareStop` are relayed to the room as `ShareStarted` / `ShareStopped`; the hub keeps no share state (late joiners miss an in-progress share)
 
 ## Design Constraints
 
@@ -54,6 +63,7 @@ dusk --server 100.x.y.z:7667 --nick yourname
 
 ## Roadmap
 
+- [x] Screen / camera sharing — `/share` signals peers, hands off to an external capture/playback tool (commands overridable via `DUSK_SHARE_*`)
 - [ ] Voice chat: cpal + libopus, UDP transport
 - [ ] Page Up/Down scroll through message history
 - [ ] Horizontal scroll / long input handling

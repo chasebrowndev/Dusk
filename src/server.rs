@@ -27,13 +27,14 @@ struct Client {
 struct State {
     rooms: HashMap<String, Room>,
     clients: HashMap<SocketAddr, Client>,
+    voice: HashMap<String, Vec<SocketAddr>>, // room -> voice members
 }
 
 impl State {
     fn new() -> Self {
         let mut rooms = HashMap::new();
         rooms.insert(DEFAULT_ROOM.to_string(), Room::default());
-        Self { rooms, clients: HashMap::new() }
+        Self { rooms, clients: HashMap::new(), voice: HashMap::new() }
     }
 
     fn ensure_room(&mut self, name: &str) {
@@ -60,6 +61,14 @@ impl State {
             .unwrap_or_default()
     }
 
+    fn room_nicks(&self, room: &str) -> Vec<String> {
+        self.rooms.get(room).map(|r| {
+            r.members.iter()
+                .filter_map(|a| self.clients.get(a).map(|c| c.nick.clone()))
+                .collect()
+        }).unwrap_or_default()
+    }
+
     fn join_room(&mut self, room: &str, addr: SocketAddr) {
         self.ensure_room(room);
         let r = self.rooms.get_mut(room).unwrap();
@@ -72,6 +81,36 @@ impl State {
         if let Some(r) = self.rooms.get_mut(room) {
             r.members.retain(|&a| a != addr);
         }
+    }
+
+    fn voice_join(&mut self, room: &str, addr: SocketAddr) {
+        let members = self.voice.entry(room.to_string()).or_default();
+        if !members.contains(&addr) {
+            members.push(addr);
+        }
+    }
+
+    fn voice_leave(&mut self, room: &str, addr: SocketAddr) {
+        if let Some(members) = self.voice.get_mut(room) {
+            members.retain(|&a| a != addr);
+        }
+    }
+
+    fn voice_nicks(&self, room: &str) -> Vec<String> {
+        self.voice.get(room).map(|members| {
+            members.iter()
+                .filter_map(|a| self.clients.get(a).map(|c| c.nick.clone()))
+                .collect()
+        }).unwrap_or_default()
+    }
+
+    fn voice_senders(&self, room: &str, exclude: Option<SocketAddr>) -> Vec<mpsc::Sender<ServerMsg>> {
+        self.voice.get(room).map(|members| {
+            members.iter()
+                .filter(|&&a| Some(a) != exclude)
+                .filter_map(|a| self.clients.get(a).map(|c| c.tx.clone()))
+                .collect()
+        }).unwrap_or_default()
     }
 
     fn push_history(&mut self, room: &str, msg: ChatMessage) {
@@ -143,19 +182,19 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
         match msg {
             ClientMsg::Join { nick, room } => {
                 let room = sanitize(&room);
-                let history = {
+                let (history, users) = {
                     let mut s = state.lock().await;
                     s.join_room(&room, addr);
                     s.clients.insert(addr, Client { nick: nick.clone(), room: room.clone(), tx: tx.clone() });
-                    s.room_history(&room)
+                    (s.room_history(&room), s.room_nicks(&room))
                 };
 
-                let _ = tx.send(ServerMsg::Joined { room: room.clone(), history }).await;
+                let _ = tx.send(ServerMsg::Joined { room: room.clone(), history, users: users.clone() }).await;
                 joined = true;
 
                 let senders = state.lock().await.room_senders(&room, Some(addr));
                 for s in senders {
-                    let _ = s.send(ServerMsg::UserJoined { room: room.clone(), nick: nick.clone() }).await;
+                    let _ = s.send(ServerMsg::UserJoined { room: room.clone(), nick: nick.clone(), users: users.clone() }).await;
                 }
 
                 let rooms = state.lock().await.room_list();
@@ -207,22 +246,25 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                     }
                 }
 
-                let old_senders = state.lock().await.room_senders(&old_room, None);
+                let (old_senders, old_users) = {
+                    let s = state.lock().await;
+                    (s.room_senders(&old_room, None), s.room_nicks(&old_room))
+                };
                 for s in old_senders {
-                    let _ = s.send(ServerMsg::UserLeft { room: old_room.clone(), nick: nick.clone() }).await;
+                    let _ = s.send(ServerMsg::UserLeft { room: old_room.clone(), nick: nick.clone(), users: old_users.clone() }).await;
                 }
 
-                let history = {
+                let (history, new_users) = {
                     let mut s = state.lock().await;
                     s.join_room(&room, addr);
-                    s.room_history(&room)
+                    (s.room_history(&room), s.room_nicks(&room))
                 };
 
-                let _ = tx.send(ServerMsg::SwitchedRoom { room: room.clone(), history }).await;
+                let _ = tx.send(ServerMsg::SwitchedRoom { room: room.clone(), history, users: new_users.clone() }).await;
 
                 let new_senders = state.lock().await.room_senders(&room, Some(addr));
                 for s in new_senders {
-                    let _ = s.send(ServerMsg::UserJoined { room: room.clone(), nick: nick.clone() }).await;
+                    let _ = s.send(ServerMsg::UserJoined { room: room.clone(), nick: nick.clone(), users: new_users.clone() }).await;
                 }
                 info!("{nick} -> #{room}");
             }
@@ -232,6 +274,93 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                 { state.lock().await.ensure_room(&name); }
                 let rooms = state.lock().await.room_list();
                 let _ = tx.send(ServerMsg::RoomList { rooms }).await;
+            }
+
+            ClientMsg::VoiceJoin if joined => {
+                let (nick, room) = {
+                    let s = state.lock().await;
+                    match s.clients.get(&addr) {
+                        Some(c) => (c.nick.clone(), c.room.clone()),
+                        None => continue,
+                    }
+                };
+                {
+                    let mut s = state.lock().await;
+                    s.voice_join(&room, addr);
+                }
+                let users = state.lock().await.voice_nicks(&room);
+                let msg = ServerMsg::VoiceJoined { room: room.clone(), nick: nick.clone(), users };
+                let senders = state.lock().await.room_senders(&room, None);
+                for s in senders {
+                    let _ = s.send(msg.clone()).await;
+                }
+                info!("{nick} joined voice in #{room}");
+            }
+
+            ClientMsg::VoiceLeave if joined => {
+                let (nick, room) = {
+                    let s = state.lock().await;
+                    match s.clients.get(&addr) {
+                        Some(c) => (c.nick.clone(), c.room.clone()),
+                        None => continue,
+                    }
+                };
+                {
+                    let mut s = state.lock().await;
+                    s.voice_leave(&room, addr);
+                }
+                let users = state.lock().await.voice_nicks(&room);
+                let msg = ServerMsg::VoiceLeft { room: room.clone(), nick: nick.clone(), users };
+                let senders = state.lock().await.room_senders(&room, None);
+                for s in senders {
+                    let _ = s.send(msg.clone()).await;
+                }
+            }
+
+            ClientMsg::VoiceData { data } if joined => {
+                let (nick, room) = {
+                    let s = state.lock().await;
+                    match s.clients.get(&addr) {
+                        Some(c) => (c.nick.clone(), c.room.clone()),
+                        None => continue,
+                    }
+                };
+                let frame = ServerMsg::VoiceFrame { nick, data };
+                let senders = state.lock().await.voice_senders(&room, Some(addr));
+                for s in senders {
+                    let _ = s.send(frame.clone()).await;
+                }
+            }
+
+            ClientMsg::ShareStart { url } if joined => {
+                let (nick, room) = {
+                    let s = state.lock().await;
+                    match s.clients.get(&addr) {
+                        Some(c) => (c.nick.clone(), c.room.clone()),
+                        None => continue,
+                    }
+                };
+                let msg = ServerMsg::ShareStarted { room: room.clone(), nick: nick.clone(), url };
+                let senders = state.lock().await.room_senders(&room, None);
+                for s in senders {
+                    let _ = s.send(msg.clone()).await;
+                }
+                info!("{nick} sharing in #{room}");
+            }
+
+            ClientMsg::ShareStop if joined => {
+                let (nick, room) = {
+                    let s = state.lock().await;
+                    match s.clients.get(&addr) {
+                        Some(c) => (c.nick.clone(), c.room.clone()),
+                        None => continue,
+                    }
+                };
+                let msg = ServerMsg::ShareStopped { room: room.clone(), nick };
+                let senders = state.lock().await.room_senders(&room, None);
+                for s in senders {
+                    let _ = s.send(msg.clone()).await;
+                }
             }
 
             ClientMsg::ListRooms => {
@@ -258,11 +387,15 @@ async fn disconnect(addr: SocketAddr, state: &Arc<Mutex<State>>) {
         let mut s = state.lock().await;
         let Some(c) = s.clients.remove(&addr) else { return };
         s.leave_room(&c.room, addr);
+        s.voice_leave(&c.room, addr);
         (c.nick, c.room)
     };
-    let senders = state.lock().await.room_senders(&room, None);
+    let (senders, users) = {
+        let s = state.lock().await;
+        (s.room_senders(&room, None), s.room_nicks(&room))
+    };
     for s in senders {
-        let _ = s.send(ServerMsg::UserLeft { room: room.clone(), nick: nick.clone() }).await;
+        let _ = s.send(ServerMsg::UserLeft { room: room.clone(), nick: nick.clone(), users: users.clone() }).await;
     }
     info!("{nick} disconnected");
 }
