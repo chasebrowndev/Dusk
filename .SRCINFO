@@ -1,0 +1,19 @@
+pkgbase = dusk
+	pkgdesc = Lightweight TUI chat over Tailscale
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/chasebrowndev/dusk
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	makedepends = cargo
+	makedepends = pkg-config
+	depends = tailscale
+	depends = ffmpeg
+	depends = wl-screenrec
+	depends = opus
+	depends = alsa-lib
+	source = dusk-0.1.0.tar.gz::https://github.com/chasebrowndev/dusk/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = dusk

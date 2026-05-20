@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::protocol::{ClientMsg, ServerMsg};
 
-pub async fn run(server: &str, nick: &str) -> Result<()> {
+pub async fn run(server: &str, nick: &str, theme_name: &str) -> Result<()> {
     let stream = TcpStream::connect(server).await?;
     let (read_half, write_half) = stream.into_split();
 
@@ -26,7 +26,7 @@ pub async fn run(server: &str, nick: &str) -> Result<()> {
         })
         .await?;
 
-    crate::ui::run(nick.to_string(), net_tx, srv_rx).await
+    crate::ui::run(nick.to_string(), theme_name.to_string(), net_tx, srv_rx).await
 }
 
 async fn reader_task(mut reader: BufReader<OwnedReadHalf>, tx: mpsc::Sender<ServerMsg>) {
