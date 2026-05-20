@@ -63,7 +63,7 @@ dusk --server 100.x.y.z:7667 --nick yourname
 
 ## Roadmap
 
-- [x] Screen / camera sharing — `/share` signals peers, hands off to an external capture/playback tool (commands overridable via `DUSK_SHARE_*`)
+- [x] Screen / camera sharing — `/share` signals peers, hands off to an external capture/playback tool (commands overridable via `DUSK_SHARE_*`); uses `wf-recorder` + `ffmpeg` by default
 - [ ] Voice chat: cpal + libopus, UDP transport
 - [ ] Page Up/Down scroll through message history
 - [ ] Horizontal scroll / long input handling

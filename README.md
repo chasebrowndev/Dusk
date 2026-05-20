@@ -36,7 +36,7 @@ makepkg -si
 ```bash
 # Dependencies (Arch)
 sudo pacman -S tailscale ffmpeg opus alsa-lib
-yay -S wl-screenrec   # or paru -S wl-screenrec
+yay -S wf-recorder   # or paru -S wf-recorder
 
 cargo install --git https://github.com/chasebrowndev/dusk
 ```
@@ -47,7 +47,7 @@ cargo install --git https://github.com/chasebrowndev/dusk
 |---------|---------|
 | `tailscale` | Network transport; peer IP detection via `tailscale ip -4` |
 | `ffmpeg` | Screen/camera stream encoding and playback |
-| `wl-screenrec` | Wayland screen capture (`/share`) |
+| `wf-recorder` | Wayland screen capture (`/share`) |
 | `opus` | Voice chat codec |
 | `alsa-lib` | Audio I/O for voice |
 
@@ -55,7 +55,7 @@ Screen sharing defaults can be overridden with environment variables:
 
 | Variable | Default |
 |----------|---------|
-| `DUSK_SHARE_SCREEN` | `wl-screenrec -f - --ffmpeg-muxer mpegts \| ffmpeg ... -listen 1 tcp://{addr}` |
+| `DUSK_SHARE_SCREEN` | `wf-recorder -f - --ffmpeg-muxer mpegts \| ffmpeg ... -listen 1 tcp://{addr}` |
 | `DUSK_SHARE_CAM` | `ffmpeg -f v4l2 -i /dev/video0 ... -listen 1 tcp://{addr}` |
 | `DUSK_SHARE_VIEW` | `ffplay -fflags nobuffer -flags low_delay -i tcp://{addr}` |
 

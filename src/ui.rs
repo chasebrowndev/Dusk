@@ -45,7 +45,7 @@ const SPLASH_ART: &[&str] = &[
 // substituted with the sharer's `host:port`.
 const SHARE_PORT: u16 = 7668;
 const DEFAULT_SHARE_SCREEN: &str =
-    "wl-screenrec -f - --ffmpeg-muxer mpegts | ffmpeg -loglevel quiet -i - -c copy -f mpegts -listen 1 tcp://{addr}";
+    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - 2>/dev/null | ffmpeg -loglevel quiet -i pipe: -c copy -f mpegts -listen 1 tcp://{addr}";
 const DEFAULT_SHARE_CAM: &str =
     "ffmpeg -loglevel quiet -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 tcp://{addr}";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
