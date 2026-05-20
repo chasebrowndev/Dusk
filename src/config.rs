@@ -10,6 +10,12 @@ pub struct Config {
     pub theme: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_device: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -53,6 +59,22 @@ impl Config {
 
     pub fn update_theme(theme: &str) -> Result<()> {
         if let Some(mut config) = Self::load()? {
+            config.theme = theme.to_string();
+            config.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn update_devices(
+        audio_input: Option<&str>,
+        audio_output: Option<&str>,
+        video_device: Option<&str>,
+        theme: &str,
+    ) -> Result<()> {
+        if let Some(mut config) = Self::load()? {
+            config.audio_input = audio_input.map(str::to_string);
+            config.audio_output = audio_output.map(str::to_string);
+            config.video_device = video_device.map(str::to_string);
             config.theme = theme.to_string();
             config.save()?;
         }

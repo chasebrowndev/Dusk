@@ -159,6 +159,9 @@ fn resolve_identity(cli: &Cli) -> Result<(String, String)> {
         machine_id: Config::machine_id(),
         theme: "cyberpunk".into(),
         server: None,
+        audio_input: None,
+        audio_output: None,
+        video_device: None,
     });
 
     // CLI overrides (don't persist --nick, do persist --theme)

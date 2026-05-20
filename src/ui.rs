@@ -31,6 +31,8 @@ use crate::protocol::{ChatMessage, ClientMsg, ServerMsg};
 use crate::theme::{Theme, by_name};
 use crate::voice::VoiceHandle;
 
+use ratatui::widgets::Clear;
+
 const SPLASH_ART: &[&str] = &[
     "·▄▄▄▄  ▄• ▄▌.▄▄ · ▄ •▄ ",
     "██▪ ██ █▪██▌▐█ ▀. █▌▄▌▪",
@@ -54,6 +56,93 @@ const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags
 enum Focus {
     Rooms,
     Input,
+    Settings,
+}
+
+struct SettingsState {
+    cursor: usize,
+    audio_inputs: Vec<String>,
+    audio_outputs: Vec<String>,
+    video_devices: Vec<String>,
+    themes: Vec<String>,
+    audio_in_idx: usize,
+    audio_out_idx: usize,
+    video_idx: usize,
+    theme_idx: usize,
+}
+
+impl SettingsState {
+    const NUM_ROWS: usize = 4;
+
+    fn new(cfg_audio_in: Option<&str>, cfg_audio_out: Option<&str>, cfg_video: Option<&str>, current_theme: &str) -> Self {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+
+        let mut audio_inputs: Vec<String> = host
+            .input_devices()
+            .map(|d| d.filter_map(|dev| dev.name().ok()).collect())
+            .unwrap_or_default();
+        if audio_inputs.is_empty() {
+            audio_inputs.push("(none)".into());
+        }
+
+        let mut audio_outputs: Vec<String> = host
+            .output_devices()
+            .map(|d| d.filter_map(|dev| dev.name().ok()).collect())
+            .unwrap_or_default();
+        if audio_outputs.is_empty() {
+            audio_outputs.push("(none)".into());
+        }
+
+        let mut video_devices: Vec<String> = (0..8)
+            .map(|i| format!("/dev/video{i}"))
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+        if video_devices.is_empty() {
+            video_devices.push("(none)".into());
+        }
+
+        let themes: Vec<String> = crate::theme::ALL.iter().map(|s| s.to_string()).collect();
+
+        let audio_in_idx = cfg_audio_in
+            .and_then(|n| audio_inputs.iter().position(|x| x == n))
+            .unwrap_or(0);
+        let audio_out_idx = cfg_audio_out
+            .and_then(|n| audio_outputs.iter().position(|x| x == n))
+            .unwrap_or(0);
+        let video_idx = cfg_video
+            .and_then(|n| video_devices.iter().position(|x| x == n))
+            .unwrap_or(0);
+        let theme_idx = themes.iter().position(|t| t == current_theme).unwrap_or(0);
+
+        SettingsState {
+            cursor: 0,
+            audio_inputs,
+            audio_outputs,
+            video_devices,
+            themes,
+            audio_in_idx,
+            audio_out_idx,
+            video_idx,
+            theme_idx,
+        }
+    }
+
+    fn audio_in(&self) -> &str {
+        self.audio_inputs.get(self.audio_in_idx).map(String::as_str).unwrap_or("(none)")
+    }
+
+    fn audio_out(&self) -> &str {
+        self.audio_outputs.get(self.audio_out_idx).map(String::as_str).unwrap_or("(none)")
+    }
+
+    fn video(&self) -> &str {
+        self.video_devices.get(self.video_idx).map(String::as_str).unwrap_or("(none)")
+    }
+
+    fn theme_name(&self) -> &str {
+        self.themes.get(self.theme_idx).map(String::as_str).unwrap_or("cyberpunk")
+    }
 }
 
 struct App {
@@ -75,10 +164,24 @@ struct App {
     shares: HashMap<String, String>,           // nick -> stream addr of active shares
     msg_width: u16,
     msg_height: u16,
+    settings: SettingsState,
+    audio_in: Option<String>,
+    audio_out: Option<String>,
+    video_device: Option<String>,
 }
 
 impl App {
     fn new(nick: String, theme: &'static Theme) -> Self {
+        let cfg = Config::load().ok().flatten();
+        let audio_in = cfg.as_ref().and_then(|c| c.audio_input.clone());
+        let audio_out = cfg.as_ref().and_then(|c| c.audio_output.clone());
+        let video_device = cfg.as_ref().and_then(|c| c.video_device.clone());
+        let settings = SettingsState::new(
+            audio_in.as_deref(),
+            audio_out.as_deref(),
+            video_device.as_deref(),
+            theme.name,
+        );
         App {
             nick,
             rooms: vec!["general".to_string()],
@@ -98,6 +201,10 @@ impl App {
             shares: HashMap::new(),
             msg_width: 0,
             msg_height: 0,
+            settings,
+            audio_in,
+            audio_out,
+            video_device,
         }
     }
 
@@ -232,6 +339,7 @@ async fn handle_key(event: Event, app: &mut App, net_tx: &mpsc::Sender<ClientMsg
     match app.focus {
         Focus::Input => handle_input_key(key, app, net_tx).await,
         Focus::Rooms => handle_rooms_key(key, app, net_tx).await,
+        Focus::Settings => handle_settings_key(key, app, net_tx).await,
     }
 }
 
@@ -341,8 +449,19 @@ async fn handle_rooms_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, Char('c')) => return true,
 
-        (_, Esc) | (_, Tab) => {
+        (_, Esc) => {
             app.focus = Focus::Input;
+        }
+
+        (_, Tab) => {
+            // Re-enumerate devices in case they changed since last open
+            app.settings = SettingsState::new(
+                app.audio_in.as_deref(),
+                app.audio_out.as_deref(),
+                app.video_device.as_deref(),
+                app.theme.name,
+            );
+            app.focus = Focus::Settings;
         }
 
         (_, Up) => {
@@ -374,6 +493,93 @@ async fn handle_rooms_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
     false
 }
 
+async fn handle_settings_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+    use KeyCode::*;
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, Char('c')) => return true,
+
+        (_, Esc) | (_, Tab) => {
+            apply_settings(app).await;
+            app.focus = Focus::Input;
+        }
+
+        (_, Up) => {
+            if app.settings.cursor > 0 {
+                app.settings.cursor -= 1;
+            }
+        }
+
+        (_, Down) => {
+            if app.settings.cursor + 1 < SettingsState::NUM_ROWS {
+                app.settings.cursor += 1;
+            }
+        }
+
+        (_, Left) => cycle_setting(app, -1, net_tx).await,
+        (_, Right) => cycle_setting(app, 1, net_tx).await,
+
+        _ => {}
+    }
+    false
+}
+
+async fn cycle_setting(app: &mut App, dir: i32, _net_tx: &mpsc::Sender<ClientMsg>) {
+    let s = &mut app.settings;
+    match s.cursor {
+        0 => {
+            let len = s.audio_inputs.len();
+            s.audio_in_idx = cycle_idx(s.audio_in_idx, len, dir);
+        }
+        1 => {
+            let len = s.audio_outputs.len();
+            s.audio_out_idx = cycle_idx(s.audio_out_idx, len, dir);
+        }
+        2 => {
+            let len = s.video_devices.len();
+            s.video_idx = cycle_idx(s.video_idx, len, dir);
+        }
+        3 => {
+            let len = s.themes.len();
+            s.theme_idx = cycle_idx(s.theme_idx, len, dir);
+            // Live-preview theme change
+            app.theme = by_name(app.settings.theme_name());
+        }
+        _ => {}
+    }
+}
+
+fn cycle_idx(idx: usize, len: usize, dir: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if dir > 0 {
+        (idx + 1) % len
+    } else if idx == 0 {
+        len - 1
+    } else {
+        idx - 1
+    }
+}
+
+async fn apply_settings(app: &mut App) {
+    let audio_in = app.settings.audio_in().to_string();
+    let audio_out = app.settings.audio_out().to_string();
+    let video = app.settings.video().to_string();
+    let theme_name = app.settings.theme_name().to_string();
+
+    app.audio_in = if audio_in == "(none)" { None } else { Some(audio_in.clone()) };
+    app.audio_out = if audio_out == "(none)" { None } else { Some(audio_out.clone()) };
+    app.video_device = if video == "(none)" { None } else { Some(video.clone()) };
+    app.theme = by_name(&theme_name);
+
+    let _ = Config::update_devices(
+        app.audio_in.as_deref(),
+        app.audio_out.as_deref(),
+        app.video_device.as_deref(),
+        &theme_name,
+    );
+}
+
 async fn toggle_voice(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
     if app.voice.is_some() {
         app.voice = None;
@@ -381,7 +587,7 @@ async fn toggle_voice(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
         let room = app.current_room.clone();
         app.push_sys(room, "left voice".into());
     } else {
-        match crate::voice::start(net_tx.clone()) {
+        match crate::voice::start(net_tx.clone(), app.audio_in.as_deref(), app.audio_out.as_deref()) {
             Ok(handle) => {
                 app.voice = Some(handle);
                 let _ = net_tx.send(ClientMsg::VoiceJoin).await;
@@ -524,10 +730,15 @@ fn share_addr() -> Option<String> {
 }
 
 // Capture command template for the requested kind, env-overridable.
-fn share_template(kind: &str) -> String {
+fn share_template(kind: &str, video_device: Option<&str>) -> String {
     match kind {
         "cam" | "camera" | "webcam" => {
-            std::env::var("DUSK_SHARE_CAM").unwrap_or_else(|_| DEFAULT_SHARE_CAM.into())
+            let tpl = std::env::var("DUSK_SHARE_CAM").unwrap_or_else(|_| DEFAULT_SHARE_CAM.into());
+            if let Some(dev) = video_device {
+                tpl.replace("/dev/video0", dev)
+            } else {
+                tpl
+            }
         }
         _ => std::env::var("DUSK_SHARE_SCREEN").unwrap_or_else(|_| DEFAULT_SHARE_SCREEN.into()),
     }
@@ -585,7 +796,7 @@ async fn share_cmd(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, arg: Option<
     };
 
     let kind = arg.unwrap_or("screen");
-    let cmd = share_template(kind).replace("{addr}", &addr);
+    let cmd = share_template(kind, app.video_device.as_deref()).replace("{addr}", &addr);
     match spawn_detached(&cmd) {
         Ok(child) => {
             app.share_child = Some(child);
@@ -736,11 +947,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_messages(f, app, messages_area);
     draw_input(f, app, input_area);
     draw_hints(f, app, hints_area);
+
+    if app.focus == Focus::Settings {
+        draw_settings(f, app, area);
+    }
 }
 
 fn draw_rooms(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let focused = app.focus == Focus::Rooms;
+    let settings_focused = app.focus == Focus::Settings;
+
+    // Split: room list on top, settings button on bottom (3 lines for a bordered block)
+    let [list_area, btn_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
 
     let items: Vec<ListItem> = app
         .rooms
@@ -777,7 +997,24 @@ fn draw_rooms(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    f.render_widget(List::new(items).block(block), area);
+    f.render_widget(List::new(items).block(block), list_area);
+
+    // Settings button
+    let btn_style = if settings_focused {
+        Style::default().fg(t.room_active).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(t.room_inactive)
+    };
+    let btn_border = if settings_focused {
+        Style::default().fg(t.border_focus)
+    } else {
+        Style::default().fg(t.border_dim)
+    };
+    let btn_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(btn_border);
+    let btn_text = Paragraph::new(Span::styled(" ⚙ settings", btn_style)).block(btn_block);
+    f.render_widget(btn_text, btn_area);
 }
 
 fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
@@ -1062,6 +1299,109 @@ fn draw_splash(f: &mut Frame, theme: &Theme) {
     );
 }
 
+fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme;
+    let s = &app.settings;
+
+    // Centered popup: 64 wide, tall enough for all rows + padding
+    let popup_w = 64u16.min(area.width);
+    let popup_h = 14u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let rect = Rect { x, y, width: popup_w, height: popup_h };
+
+    f.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .title(Span::styled(
+            " Settings ",
+            Style::default().fg(t.border_focus).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.border_focus));
+
+    let inner = outer.inner(rect);
+    f.render_widget(outer, rect);
+
+    // Layout: content rows on top, hint line on bottom
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    // Build display rows: (label, value, cursor_pos) where cursor_pos is Some(i) if row i maps to settings.cursor
+    struct Row {
+        label: &'static str,
+        value: String,
+        cursor_idx: Option<usize>,
+    }
+
+    let rows: Vec<Row> = vec![
+        Row { label: "  AUDIO", value: String::new(), cursor_idx: None },
+        Row { label: "    Microphone", value: s.audio_in().to_string(), cursor_idx: Some(0) },
+        Row { label: "    Speaker", value: s.audio_out().to_string(), cursor_idx: Some(1) },
+        Row { label: "", value: String::new(), cursor_idx: None },
+        Row { label: "  VIDEO", value: String::new(), cursor_idx: None },
+        Row { label: "    Camera", value: s.video().to_string(), cursor_idx: Some(2) },
+        Row { label: "", value: String::new(), cursor_idx: None },
+        Row { label: "  APPEARANCE", value: String::new(), cursor_idx: None },
+        Row { label: "    Theme", value: s.theme_name().to_string(), cursor_idx: Some(3) },
+    ];
+
+    // inner width = popup_w - 2 borders; label=18, arrows=4 => value gets the rest
+    let value_col_w = (popup_w.saturating_sub(2)).saturating_sub(22) as usize;
+
+    let lines: Vec<Line> = rows.iter().map(|row| {
+        if row.cursor_idx.is_none() {
+            // Section header or spacer
+            if row.label.is_empty() {
+                Line::from("")
+            } else {
+                Line::from(Span::styled(
+                    row.label,
+                    Style::default().fg(t.hint_text).add_modifier(Modifier::BOLD),
+                ))
+            }
+        } else {
+            let is_active = row.cursor_idx == Some(s.cursor);
+            let label_style = if is_active {
+                Style::default().fg(t.room_active).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.msg_text)
+            };
+            let arrow_style = Style::default().fg(t.border_focus);
+            let val_style = if is_active {
+                Style::default().fg(t.border_focus).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(t.msg_nick)
+            };
+
+            // Truncate value to fit, left-pad to fixed width for alignment
+            let val = if row.value.chars().count() > value_col_w {
+                let truncated: String = row.value.chars().take(value_col_w.saturating_sub(1)).collect();
+                format!("{}…", truncated)
+            } else {
+                format!("{:<width$}", row.value, width = value_col_w)
+            };
+
+            Line::from(vec![
+                Span::styled(format!("{:<18}", row.label), label_style),
+                Span::styled(if is_active { "< " } else { "  " }, arrow_style),
+                Span::styled(val, val_style),
+                Span::styled(if is_active { " >" } else { "  " }, arrow_style),
+            ])
+        }
+    }).collect();
+
+    f.render_widget(Paragraph::new(Text::from(lines)), content_area);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " ↑↓ navigate   ← → change   tab / esc  save & close",
+            Style::default().fg(t.hint_text),
+        )),
+        hint_area,
+    );
+}
+
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let voice_hint = if app.voice.is_some() { "  v:mic-off" } else { "  v:voice" };
@@ -1069,7 +1409,8 @@ fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
         Focus::Input => {
             format!(" tab:rooms  pgup/dn:scroll  shift+↵:newline  /help{voice_hint}  ^c:quit")
         }
-        Focus::Rooms => " ↑↓:navigate  enter:join  tab/esc:back".to_string(),
+        Focus::Rooms => " ↑↓:navigate  enter:join  esc:back  tab:settings".to_string(),
+        Focus::Settings => " ↑↓:navigate  ←→:change  tab/esc:save & close".to_string(),
     };
     f.render_widget(
         Paragraph::new(text.as_str()).style(Style::default().fg(t.hint_text)),

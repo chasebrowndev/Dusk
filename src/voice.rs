@@ -1,6 +1,6 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -18,15 +18,32 @@ pub struct VoiceHandle {
     _output_stream: cpal::Stream,
 }
 
-pub fn start(net_tx: mpsc::Sender<ClientMsg>) -> Result<VoiceHandle> {
+pub fn start(
+    net_tx: mpsc::Sender<ClientMsg>,
+    audio_in: Option<&str>,
+    audio_out: Option<&str>,
+) -> Result<VoiceHandle> {
+    use cpal::traits::DeviceTrait;
     let host = cpal::default_host();
 
-    let in_dev = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no microphone found"))?;
-    let out_dev = host
-        .default_output_device()
-        .ok_or_else(|| anyhow::anyhow!("no audio output found"))?;
+    let in_dev = match audio_in {
+        Some(name) => host
+            .input_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+            .ok_or_else(|| anyhow::anyhow!("audio input not found: {name}"))?,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("no microphone found"))?,
+    };
+    let out_dev = match audio_out {
+        Some(name) => host
+            .output_devices()?
+            .find(|d| d.name().ok().as_deref() == Some(name))
+            .ok_or_else(|| anyhow::anyhow!("audio output not found: {name}"))?,
+        None => host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("no audio output found"))?,
+    };
 
     let cfg = cpal::StreamConfig {
         channels: 1,
