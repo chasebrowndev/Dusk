@@ -14,6 +14,6 @@ pkgbase = dusk
 	depends = opus
 	depends = alsa-lib
 	source = dusk-0.1.0.tar.gz::https://github.com/chasebrowndev/dusk/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = dac2ee635a8384f509f8da1e79472d9eedbb30069b3dd5c89a0a9fa0fb37c8a6
 
 pkgname = dusk

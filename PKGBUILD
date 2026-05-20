@@ -9,7 +9,7 @@ license=('MIT')
 depends=('tailscale' 'ffmpeg' 'wl-screenrec' 'opus' 'alsa-lib')
 makedepends=('rust' 'cargo' 'pkg-config')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('dac2ee635a8384f509f8da1e79472d9eedbb30069b3dd5c89a0a9fa0fb37c8a6')
 
 prepare() {
     cd "$pkgname-$pkgver"
