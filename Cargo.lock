@@ -658,6 +658,7 @@ dependencies = [
  "crossterm",
  "futures",
  "image",
+ "libc",
  "opus",
  "ratatui",
  "rusqlite",

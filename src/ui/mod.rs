@@ -52,9 +52,9 @@ const SPLASH_ART: &[&str] = &[
 // substituted with the sharer's `host:port`.
 const SHARE_PORT: u16 = 7668;
 const DEFAULT_SHARE_SCREEN: &str =
-    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - 2>/dev/null | ffmpeg -loglevel quiet -i pipe: -c copy -f mpegts -listen 1 tcp://{addr}";
+    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -i pipe: -c copy -f mpegts -listen 1 tcp://{addr}";
 const DEFAULT_SHARE_CAM: &str =
-    "ffmpeg -loglevel quiet -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 tcp://{addr}";
+    "ffmpeg -loglevel warning -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 tcp://{addr}";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
 
 // Modal state machine (Phase 4).
@@ -104,21 +104,23 @@ const CONTROL_BUTTONS: [ControlButton; 4] = [
 ];
 
 impl Pane {
+    // Layout: left column is Rooms (top) over Controls (bottom). Right column
+    // is Center (full body height). Composer spans the full input row below.
     fn move_h(self, dir: i32) -> Self {
         match (self, dir) {
             (Pane::Rooms, 1) => Pane::Center,
+            (Pane::Controls, 1) => Pane::Center,
             (Pane::Center, -1) => Pane::Rooms,
-            (Pane::Composer, 1) => Pane::Controls,
-            (Pane::Controls, -1) => Pane::Composer,
             _ => self,
         }
     }
     fn move_v(self, dir: i32) -> Self {
         match (self, dir) {
-            (Pane::Rooms, 1) => Pane::Composer,
-            (Pane::Composer, -1) => Pane::Rooms,
-            (Pane::Center, 1) => Pane::Controls,
-            (Pane::Controls, -1) => Pane::Center,
+            (Pane::Rooms, 1) => Pane::Controls,
+            (Pane::Controls, -1) => Pane::Rooms,
+            (Pane::Controls, 1) => Pane::Composer,
+            (Pane::Center, 1) => Pane::Composer,
+            (Pane::Composer, -1) => Pane::Center,
             _ => self,
         }
     }
@@ -544,11 +546,12 @@ async fn handle_select_key(key: KeyEvent, app: &mut App) -> bool {
         (_, Up) => app.pane = app.pane.move_v(-1),
         (_, Down) => app.pane = app.pane.move_v(1),
         (_, Tab) => {
-            // Quick cycle through panes for keyboards that favor Tab.
+            // Tab cycles visually: down the left column, then over to the
+            // right column, then to the composer.
             app.pane = match app.pane {
-                Pane::Rooms => Pane::Center,
-                Pane::Center => Pane::Controls,
-                Pane::Controls => Pane::Composer,
+                Pane::Rooms => Pane::Controls,
+                Pane::Controls => Pane::Center,
+                Pane::Center => Pane::Composer,
                 Pane::Composer => Pane::Rooms,
             };
         }
@@ -898,16 +901,25 @@ fn share_template(kind: &str, video_device: Option<&str>) -> String {
 }
 
 // Spawn a shell command detached from the TUI: no shared stdio, and in its own
-// process group so the whole pipeline can be signalled as a unit.
+// process group so the whole pipeline can be signalled as a unit. stderr lands
+// in /tmp/dusk-share.log so a silent pipeline failure (wf-recorder missing
+// $WAYLAND_DISPLAY, ffmpeg can't bind port, etc.) is observable via `tail -f`.
 fn spawn_detached(cmd: &str) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dusk-share.log")
+        .ok()
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log)
         .process_group(0)
         .spawn()
 }
@@ -1097,41 +1109,46 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
         }
 
         ServerMsg::ShareStarted { room, nick, kind, url } => {
-            if nick != app.nick {
-                let entry = app.shares.entry(nick.clone()).or_default();
-                entry.retain(|(k, _)| *k != kind);
-                entry.push((kind, url.clone()));
-                let label = match kind {
-                    crate::protocol::ShareKind::Screen => "screen",
-                    crate::protocol::ShareKind::Cam => "cam",
-                };
-                if room == app.current_room {
-                    app.center_tab = CenterTab::Stream;
+            // Record the share for everyone (sharer included) so the Stream tab
+            // reflects reality. Skip spawning a viewer for our own share — that
+            // would race the real peer for ffmpeg's `-listen 1` socket.
+            let is_self = nick == app.nick;
+            let entry = app.shares.entry(nick.clone()).or_default();
+            entry.retain(|(k, _)| *k != kind);
+            entry.push((kind, url.clone()));
+            let label = match kind {
+                crate::protocol::ShareKind::Screen => "screen",
+                crate::protocol::ShareKind::Cam => "cam",
+            };
+            if room == app.current_room {
+                app.center_tab = CenterTab::Stream;
+            }
+            if !is_self && is_kitty() {
+                if let Some(v) = ViewerHandle::spawn(url, kind) {
+                    app.inbound_views.insert((nick.clone(), kind), v);
                 }
-                if is_kitty() {
-                    if let Some(v) = ViewerHandle::spawn(url, kind) {
-                        app.inbound_views.insert((nick.clone(), kind), v);
-                    }
-                }
+            }
+            if !is_self {
                 app.push_sys(room, format!("{nick} is sharing {label} — Stream tab"));
             }
         }
 
         ServerMsg::ShareStopped { room, nick, kind } => {
-            if nick != app.nick {
-                match kind {
-                    Some(k) => {
-                        if let Some(v) = app.shares.get_mut(&nick) {
-                            v.retain(|(kk, _)| *kk != k);
-                            if v.is_empty() { app.shares.remove(&nick); }
-                        }
-                        app.inbound_views.remove(&(nick.clone(), k));
+            let is_self = nick == app.nick;
+            match kind {
+                Some(k) => {
+                    if let Some(v) = app.shares.get_mut(&nick) {
+                        v.retain(|(kk, _)| *kk != k);
+                        if v.is_empty() { app.shares.remove(&nick); }
                     }
-                    None => {
-                        app.shares.remove(&nick);
-                        app.inbound_views.retain(|(n, _), _| n != &nick);
-                    }
+                    app.inbound_views.remove(&(nick.clone(), k));
                 }
+                None => {
+                    app.shares.remove(&nick);
+                    app.inbound_views.retain(|(n, _), _| n != &nick);
+                }
+            }
+            if !is_self {
                 let label = match kind {
                     Some(crate::protocol::ShareKind::Screen) => "screen",
                     Some(crate::protocol::ShareKind::Cam) => "cam",
@@ -1172,13 +1189,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     let [sidebar, center_area] =
         Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).areas(body);
 
-    let [composer_area, controls_area] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(22)]).areas(input_area);
+    // Sidebar stacks Rooms (flexible, collapses first) over a fixed-height
+    // Controls block. Controls: 4 buttons + top/bottom borders = 6 rows.
+    let [rooms_area, controls_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).areas(sidebar);
 
     draw_active_bar(f, app, active_area);
-    draw_rooms(f, app, sidebar);
+    draw_rooms(f, app, rooms_area);
     draw_center(f, app, center_area);
-    draw_composer(f, app, composer_area);
+    draw_composer(f, app, input_area);
     draw_controls(f, app, controls_area);
     draw_hints(f, app, hints_area);
 
@@ -1358,7 +1377,7 @@ fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
             "active streams:",
             Style::default().fg(t.hint_text).add_modifier(Modifier::BOLD),
         ))];
-        for (s, kinds) in sharers {
+        for (s, kinds) in &sharers {
             let kind_str: Vec<&str> = kinds
                 .iter()
                 .map(|k| match k {
@@ -1366,14 +1385,34 @@ fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
                     crate::protocol::ShareKind::Cam => "cam",
                 })
                 .collect();
+            // Surface per-kind framing state: live (frames arriving), connecting
+                // (handle spawned, no frame yet), or off (no viewer for this kind —
+            // self-share, or non-kitty terminal).
+            let state: Vec<&str> = kinds
+                .iter()
+                .map(|k| match app.inbound_views.get(&(s.clone(), *k)) {
+                    Some(h) => match h.frame.lock().ok().and_then(|g| g.clone()) {
+                        Some(_) => "live",
+                        None => "connecting",
+                    },
+                    None => "off",
+                })
+                .collect();
             out.push(Line::from(Span::styled(
-                format!("  ● {s} — {}", kind_str.join(" + ")),
+                format!("  ● {s} — {} [{}]", kind_str.join(" + "), state.join(" + ")),
                 Style::default().fg(t.msg_nick),
             )));
         }
         out.push(Line::from(""));
+        let hint = if !is_kitty() {
+            "use /watch <nick> to open viewer (non-kitty terminal)"
+        } else if sharers.iter().any(|(n, _)| n == &app.nick) && sharers.len() == 1 {
+            "you are sharing — peer will see your stream inline"
+        } else {
+            "inline rendering: frames overlay this pane when [live]"
+        };
         out.push(Line::from(Span::styled(
-            if is_kitty() { "inline rendering active" } else { "use /watch <nick> to open viewer (non-kitty terminal)" },
+            hint,
             Style::default().fg(t.room_inactive),
         )));
         out

@@ -28,19 +28,30 @@ pub(crate) struct ViewerHandle {
 impl ViewerHandle {
     pub fn spawn(url: String, kind: ShareKind) -> Option<Self> {
         // 480p @ 15fps BMP — small enough to decode in real time, big enough to read.
+        // Default to `warning` so pipeline failures land in the log instead of /dev/null.
         let tpl = std::env::var("DUSK_VIEW_INLINE").unwrap_or_else(|_| {
-            "ffmpeg -loglevel quiet -fflags nobuffer -flags low_delay \
+            "ffmpeg -loglevel warning -fflags nobuffer -flags low_delay \
              -i tcp://{addr} -vf scale=640:-2,fps=15 -f image2pipe -vcodec bmp -"
                 .into()
         });
         let cmd = tpl.replace("{addr}", &url);
+
+        // ffmpeg stderr → /tmp/dusk-view.log so the user can `tail -f` it when
+        // reproducing "blank stream" failures. Falls back to null on any error.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/dusk-view.log")
+            .ok()
+            .map(Stdio::from)
+            .unwrap_or_else(Stdio::null);
 
         let mut child: Child = Command::new("sh")
             .arg("-c")
             .arg(&cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(log)
             .process_group(0)
             .spawn()
             .ok()?;

@@ -29,19 +29,19 @@ struct Cli {
     command: Option<Command>,
 
     /// Hub server address (host:port) — saved to config after first use
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     server: Option<String>,
 
     /// Your nickname (overrides saved config)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     nick: Option<String>,
 
     /// Color theme name (run /theme in-app to list all)
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, global = true)]
     theme: Option<String>,
 
     /// Connect as a guest (random nick, ignores saved identity)
-    #[arg(short = 'g', long)]
+    #[arg(short = 'g', long, global = true)]
     guest: bool,
 }
 
@@ -66,13 +66,33 @@ pub struct ResolvedServer {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // ALSA + libusb + a few graphics libs love to dump probe errors to stderr,
+    // which scribbles over the ratatui alt-screen. The TUI is the only UX
+    // surface, so muzzle fd 2 before anything cpal/v4l-adjacent runs.
+    silence_stderr();
+
+    let (nick, theme_name) = resolve_identity(&cli)?;
     match cli.command {
         Some(Command::Serve { bind }) => {
-            tracing_subscriber::fmt::init();
-            server::run(&bind).await
+            // Host mode: run the hub *and* a local TUI client. Tracing would
+            // clobber the alt-screen, so leave the global subscriber unset.
+            let port = bind.rsplit_once(':').map(|(_, p)| p.to_string()).unwrap_or_else(|| "7667".into());
+            let server_task = tokio::spawn(async move { server::run(&bind).await });
+            // Derive a localhost connect address from the bind string. 0.0.0.0
+            // and :: are special-cased; otherwise use the bind host verbatim.
+            let connect_addr = format!("127.0.0.1:{port}");
+            // Wait briefly for the listener to come up before connecting.
+            for _ in 0..20 {
+                if tokio::net::TcpStream::connect(&connect_addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let res = client::run(&connect_addr, &nick, &theme_name).await;
+            server_task.abort();
+            res
         }
         None => {
-            let (nick, theme_name) = resolve_identity(&cli)?;
             let resolved = resolve_server(&cli).await?;
             // TODO(handoff): pass resolved.discovery_summary into App initial
             // state once the TUI agent exposes a status-overlay hook.
@@ -260,6 +280,16 @@ async fn handshake_probe(addr: &str) -> Result<String> {
     })
     .await
     .map_err(|_| anyhow!("handshake timed out"))?
+}
+
+fn silence_stderr() {
+    unsafe {
+        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, 2);
+            libc::close(devnull);
+        }
+    }
 }
 
 fn resolve_identity(cli: &Cli) -> Result<(String, String)> {
