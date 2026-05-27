@@ -19,3 +19,6 @@ toml = "0.8"
 cpal = "0.15"
 opus = "0.3"
 base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+viuer = "0.9"
+image = "0.25"

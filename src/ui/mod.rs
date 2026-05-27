@@ -1,7 +1,9 @@
+mod commands;
+mod text;
+
 use std::collections::HashMap;
 
 use anyhow::Result;
-use chrono::{Local, TimeZone};
 use crossterm::{
     event::{
         Event, EventStream, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -52,11 +54,78 @@ const DEFAULT_SHARE_CAM: &str =
     "ffmpeg -loglevel quiet -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 tcp://{addr}";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
 
+// Modal state machine (Phase 4).
+//
+// Compose  — default; keystrokes go to the composer.
+// Select   — focus ring moves between panes via arrows; Enter enters Pane mode
+//            (or returns to Compose if the ring is on the Composer pane).
+// Pane     — arrows do what the focused pane defines; Esc returns to Select.
+// Settings — centered overlay; Esc closes back to Compose.
 #[derive(PartialEq, Clone, Copy)]
-enum Focus {
-    Rooms,
-    Input,
+enum Mode {
+    Compose,
+    Select,
+    Pane,
     Settings,
+}
+
+// 2×2 pane grid:  Rooms     Center
+//                 Composer  Controls
+#[derive(PartialEq, Clone, Copy)]
+enum Pane {
+    Rooms,
+    Center,
+    Composer,
+    Controls,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum CenterTab {
+    Messages,
+    Stream,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ControlButton {
+    Voice,
+    ShareScreen,
+    ShareCam,
+    Settings,
+}
+
+const CONTROL_BUTTONS: [ControlButton; 4] = [
+    ControlButton::Voice,
+    ControlButton::ShareScreen,
+    ControlButton::ShareCam,
+    ControlButton::Settings,
+];
+
+impl Pane {
+    fn move_h(self, dir: i32) -> Self {
+        match (self, dir) {
+            (Pane::Rooms, 1) => Pane::Center,
+            (Pane::Center, -1) => Pane::Rooms,
+            (Pane::Composer, 1) => Pane::Controls,
+            (Pane::Controls, -1) => Pane::Composer,
+            _ => self,
+        }
+    }
+    fn move_v(self, dir: i32) -> Self {
+        match (self, dir) {
+            (Pane::Rooms, 1) => Pane::Composer,
+            (Pane::Composer, -1) => Pane::Rooms,
+            (Pane::Center, 1) => Pane::Controls,
+            (Pane::Controls, -1) => Pane::Center,
+            _ => self,
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct DeviceConfig {
+    audio_in: Option<String>,
+    audio_out: Option<String>,
+    video_device: Option<String>,
 }
 
 struct SettingsState {
@@ -153,7 +222,10 @@ struct App {
     input: String,
     cursor: usize, // byte offset into `input`, kept on a char boundary
     status: Option<String>,
-    focus: Focus,
+    mode: Mode,
+    pane: Pane,
+    center_tab: CenterTab,
+    controls_cursor: usize,
     room_cursor: usize,
     scroll: HashMap<String, usize>,
     theme: &'static Theme,
@@ -165,21 +237,21 @@ struct App {
     msg_width: u16,
     msg_height: u16,
     settings: SettingsState,
-    audio_in: Option<String>,
-    audio_out: Option<String>,
-    video_device: Option<String>,
+    devices: DeviceConfig,
 }
 
 impl App {
     fn new(nick: String, theme: &'static Theme) -> Self {
         let cfg = Config::load().ok().flatten();
-        let audio_in = cfg.as_ref().and_then(|c| c.audio_input.clone());
-        let audio_out = cfg.as_ref().and_then(|c| c.audio_output.clone());
-        let video_device = cfg.as_ref().and_then(|c| c.video_device.clone());
+        let devices = DeviceConfig {
+            audio_in: cfg.as_ref().and_then(|c| c.audio_input.clone()),
+            audio_out: cfg.as_ref().and_then(|c| c.audio_output.clone()),
+            video_device: cfg.as_ref().and_then(|c| c.video_device.clone()),
+        };
         let settings = SettingsState::new(
-            audio_in.as_deref(),
-            audio_out.as_deref(),
-            video_device.as_deref(),
+            devices.audio_in.as_deref(),
+            devices.audio_out.as_deref(),
+            devices.video_device.as_deref(),
             theme.name,
         );
         App {
@@ -190,7 +262,10 @@ impl App {
             input: String::new(),
             cursor: 0,
             status: None,
-            focus: Focus::Input,
+            mode: Mode::Compose,
+            pane: Pane::Composer,
+            center_tab: CenterTab::Messages,
+            controls_cursor: 0,
             room_cursor: 0,
             scroll: HashMap::new(),
             theme,
@@ -202,9 +277,7 @@ impl App {
             msg_width: 0,
             msg_height: 0,
             settings,
-            audio_in,
-            audio_out,
-            video_device,
+            devices,
         }
     }
 
@@ -223,6 +296,7 @@ impl App {
         self.push_msg(
             &room,
             ChatMessage {
+                msg_id: 0,
                 nick: String::new(),
                 content: text,
                 ts: chrono::Utc::now().timestamp(),
@@ -336,21 +410,31 @@ pub async fn run(
 
 async fn handle_key(event: Event, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
     let Event::Key(key) = event else { return false };
-    match app.focus {
-        Focus::Input => handle_input_key(key, app, net_tx).await,
-        Focus::Rooms => handle_rooms_key(key, app, net_tx).await,
-        Focus::Settings => handle_settings_key(key, app, net_tx).await,
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+        return true;
+    }
+    match app.mode {
+        Mode::Compose => handle_compose_key(key, app, net_tx).await,
+        Mode::Select => handle_select_key(key, app).await,
+        Mode::Pane => handle_pane_key(key, app, net_tx).await,
+        Mode::Settings => handle_settings_key(key, app, net_tx).await,
     }
 }
 
-async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+// Compose mode: keystrokes go to the composer. Esc enters Select mode.
+async fn handle_compose_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
     use KeyCode::*;
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, Char('c')) => return true,
+        // Esc: leave Compose, enter Select. Default focus = Center (per plan).
+        (_, Esc) => {
+            app.mode = Mode::Select;
+            app.pane = Pane::Center;
+        }
 
-        // Tab: move focus to room sidebar, sync cursor to current room
+        // Tab: legacy alias — also moves into Select-on-Rooms for quick room access.
         (_, Tab) => {
-            app.focus = Focus::Rooms;
+            app.mode = Mode::Select;
+            app.pane = Pane::Rooms;
             app.room_cursor = app
                 .rooms
                 .iter()
@@ -358,14 +442,13 @@ async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
                 .unwrap_or(0);
         }
 
-        // Shift+Enter / Alt+Enter: insert a newline (Alt is the fallback for
-        // terminals without the enhanced keyboard protocol).
+        // Shift+Enter / Alt+Enter: insert a newline.
         (KeyModifiers::SHIFT, Enter) | (KeyModifiers::ALT, Enter) => {
             app.input.insert(app.cursor, '\n');
             app.cursor += 1;
         }
 
-        // Enter: send the message / run the command
+        // Enter: send the message / run the command.
         (_, Enter) => {
             let content: String = app.input.drain(..).collect();
             app.cursor = 0;
@@ -379,7 +462,6 @@ async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
             }
         }
 
-        // Backspace: delete the char before the cursor
         (_, Backspace) => {
             if app.cursor > 0 {
                 let prev = prev_char_boundary(&app.input, app.cursor);
@@ -388,7 +470,6 @@ async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
             }
         }
 
-        // Ctrl+W: delete the word before the cursor
         (KeyModifiers::CONTROL, Char('w')) => {
             let head = &app.input[..app.cursor];
             let trimmed_len = head.trim_end_matches([' ', '\n']).len();
@@ -400,36 +481,28 @@ async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
             app.cursor = cut;
         }
 
-        // Ctrl+U: clear the input
         (KeyModifiers::CONTROL, Char('u')) => {
             app.input.clear();
             app.cursor = 0;
         }
 
-        // V: toggle voice (only when there is nothing to send)
+        // V: toggle voice (only when there is nothing to send).
         (KeyModifiers::NONE, Char('v')) if app.input.is_empty() => {
             toggle_voice(app, net_tx).await;
         }
 
-        // Printable char: insert at the cursor
         (_, Char(c)) => {
             app.input.insert(app.cursor, c);
             app.cursor += c.len_utf8();
         }
 
-        // Left/Right: move the cursor through the typed text
         (_, Left) => app.cursor = prev_char_boundary(&app.input, app.cursor),
         (_, Right) => app.cursor = next_char_boundary(&app.input, app.cursor),
-
-        // Up/Down: move the cursor between lines of the typed text
         (_, Up) => app.cursor = move_cursor_vertical(&app.input, app.cursor, -1),
         (_, Down) => app.cursor = move_cursor_vertical(&app.input, app.cursor, 1),
-
-        // Home/End: jump to start/end of the input
         (_, Home) => app.cursor = 0,
         (_, End) => app.cursor = app.input.len(),
 
-        // PageUp/PageDown: smooth scroll through message history
         (_, PageUp) => {
             let step = (app.msg_height as usize / 2).max(1);
             app.scroll_up(step);
@@ -444,80 +517,188 @@ async fn handle_input_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<Cl
     false
 }
 
-async fn handle_rooms_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+// Select mode: arrows move focus ring through panes; Enter enters Pane mode
+// (or returns to Compose if ring is on Composer); Esc returns to Compose.
+async fn handle_select_key(key: KeyEvent, app: &mut App) -> bool {
     use KeyCode::*;
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, Char('c')) => return true,
-
         (_, Esc) => {
-            app.focus = Focus::Input;
+            app.mode = Mode::Compose;
+            app.pane = Pane::Composer;
         }
-
+        (_, Left) => app.pane = app.pane.move_h(-1),
+        (_, Right) => app.pane = app.pane.move_h(1),
+        (_, Up) => app.pane = app.pane.move_v(-1),
+        (_, Down) => app.pane = app.pane.move_v(1),
         (_, Tab) => {
-            // Re-enumerate devices in case they changed since last open
-            app.settings = SettingsState::new(
-                app.audio_in.as_deref(),
-                app.audio_out.as_deref(),
-                app.video_device.as_deref(),
-                app.theme.name,
-            );
-            app.focus = Focus::Settings;
-        }
-
-        (_, Up) => {
-            if app.rooms.is_empty() {
-                return false;
-            }
-            app.room_cursor = if app.room_cursor == 0 {
-                app.rooms.len() - 1
-            } else {
-                app.room_cursor - 1
+            // Quick cycle through panes for keyboards that favor Tab.
+            app.pane = match app.pane {
+                Pane::Rooms => Pane::Center,
+                Pane::Center => Pane::Controls,
+                Pane::Controls => Pane::Composer,
+                Pane::Composer => Pane::Rooms,
             };
         }
-
-        (_, Down) => {
-            if !app.rooms.is_empty() {
-                app.room_cursor = (app.room_cursor + 1) % app.rooms.len();
-            }
-        }
-
         (_, Enter) => {
-            if let Some(room) = app.rooms.get(app.room_cursor).cloned() {
-                do_switch(app, net_tx, room).await;
+            if app.pane == Pane::Composer {
+                // Composer doesn't have a separate Pane mode — Compose IS it.
+                app.mode = Mode::Compose;
+            } else {
+                if app.pane == Pane::Rooms {
+                    app.room_cursor = app
+                        .rooms
+                        .iter()
+                        .position(|r| r == &app.current_room)
+                        .unwrap_or(0);
+                }
+                app.mode = Mode::Pane;
             }
-            app.focus = Focus::Input;
         }
-
         _ => {}
     }
     false
 }
 
+// Pane mode: dispatch by focused pane.
+async fn handle_pane_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+    use KeyCode::*;
+    // Esc always pops back to Select.
+    if matches!(key.code, Esc) {
+        app.mode = Mode::Select;
+        return false;
+    }
+    match app.pane {
+        Pane::Rooms => handle_rooms_pane_key(key, app, net_tx).await,
+        Pane::Center => handle_center_pane_key(key, app).await,
+        Pane::Controls => handle_controls_pane_key(key, app, net_tx).await,
+        Pane::Composer => {
+            // Shouldn't normally land here — Select-on-Composer + Enter routes
+            // to Compose mode. Snap back if it does.
+            app.mode = Mode::Compose;
+            false
+        }
+    }
+}
+
+async fn handle_rooms_pane_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+    use KeyCode::*;
+    match (key.modifiers, key.code) {
+        (_, Up) => {
+            if !app.rooms.is_empty() {
+                app.room_cursor = if app.room_cursor == 0 {
+                    app.rooms.len() - 1
+                } else {
+                    app.room_cursor - 1
+                };
+            }
+        }
+        (_, Down) => {
+            if !app.rooms.is_empty() {
+                app.room_cursor = (app.room_cursor + 1) % app.rooms.len();
+            }
+        }
+        (_, Enter) => {
+            if let Some(room) = app.rooms.get(app.room_cursor).cloned() {
+                do_switch(app, net_tx, room).await;
+            }
+            app.mode = Mode::Compose;
+            app.pane = Pane::Composer;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_center_pane_key(key: KeyEvent, app: &mut App) -> bool {
+    use KeyCode::*;
+    match (key.modifiers, key.code) {
+        (_, Left) => app.center_tab = CenterTab::Messages,
+        (_, Right) => app.center_tab = CenterTab::Stream,
+        (_, Up) => app.scroll_up(1),
+        (_, Down) => app.scroll_down(1),
+        (_, PageUp) => {
+            let step = (app.msg_height as usize / 2).max(1);
+            app.scroll_up(step);
+        }
+        (_, PageDown) => {
+            let step = (app.msg_height as usize / 2).max(1);
+            app.scroll_down(step);
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn handle_controls_pane_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
+    use KeyCode::*;
+    match (key.modifiers, key.code) {
+        (_, Up) => {
+            app.controls_cursor = if app.controls_cursor == 0 {
+                CONTROL_BUTTONS.len() - 1
+            } else {
+                app.controls_cursor - 1
+            };
+        }
+        (_, Down) => {
+            app.controls_cursor = (app.controls_cursor + 1) % CONTROL_BUTTONS.len();
+        }
+        (_, Enter) => {
+            press_control(app, net_tx, CONTROL_BUTTONS[app.controls_cursor]).await;
+        }
+        _ => {}
+    }
+    false
+}
+
+async fn press_control(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, btn: ControlButton) {
+    match btn {
+        ControlButton::Voice => toggle_voice(app, net_tx).await,
+        ControlButton::ShareScreen => {
+            if app.share_child.is_some() {
+                share_stop(app, net_tx).await;
+            } else {
+                share_cmd(app, net_tx, Some(crate::protocol::ShareKind::Screen)).await;
+            }
+        }
+        ControlButton::ShareCam => {
+            if app.share_child.is_some() {
+                share_stop(app, net_tx).await;
+            } else {
+                share_cmd(app, net_tx, Some(crate::protocol::ShareKind::Cam)).await;
+            }
+        }
+        ControlButton::Settings => {
+            app.settings = SettingsState::new(
+                app.devices.audio_in.as_deref(),
+                app.devices.audio_out.as_deref(),
+                app.devices.video_device.as_deref(),
+                app.theme.name,
+            );
+            app.mode = Mode::Settings;
+        }
+    }
+}
+
 async fn handle_settings_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) -> bool {
     use KeyCode::*;
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, Char('c')) => return true,
-
         (_, Esc) | (_, Tab) => {
             apply_settings(app).await;
-            app.focus = Focus::Input;
+            app.mode = Mode::Compose;
+            app.pane = Pane::Composer;
         }
-
         (_, Up) => {
             if app.settings.cursor > 0 {
                 app.settings.cursor -= 1;
             }
         }
-
         (_, Down) => {
             if app.settings.cursor + 1 < SettingsState::NUM_ROWS {
                 app.settings.cursor += 1;
             }
         }
-
         (_, Left) => cycle_setting(app, -1, net_tx).await,
         (_, Right) => cycle_setting(app, 1, net_tx).await,
-
         _ => {}
     }
     false
@@ -567,15 +748,15 @@ async fn apply_settings(app: &mut App) {
     let video = app.settings.video().to_string();
     let theme_name = app.settings.theme_name().to_string();
 
-    app.audio_in = if audio_in == "(none)" { None } else { Some(audio_in.clone()) };
-    app.audio_out = if audio_out == "(none)" { None } else { Some(audio_out.clone()) };
-    app.video_device = if video == "(none)" { None } else { Some(video.clone()) };
+    app.devices.audio_in = if audio_in == "(none)" { None } else { Some(audio_in.clone()) };
+    app.devices.audio_out = if audio_out == "(none)" { None } else { Some(audio_out.clone()) };
+    app.devices.video_device = if video == "(none)" { None } else { Some(video.clone()) };
     app.theme = by_name(&theme_name);
 
     let _ = Config::update_devices(
-        app.audio_in.as_deref(),
-        app.audio_out.as_deref(),
-        app.video_device.as_deref(),
+        app.devices.audio_in.as_deref(),
+        app.devices.audio_out.as_deref(),
+        app.devices.video_device.as_deref(),
         &theme_name,
     );
 }
@@ -587,7 +768,7 @@ async fn toggle_voice(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
         let room = app.current_room.clone();
         app.push_sys(room, "left voice".into());
     } else {
-        match crate::voice::start(net_tx.clone(), app.audio_in.as_deref(), app.audio_out.as_deref()) {
+        match crate::voice::start(net_tx.clone(), app.devices.audio_in.as_deref(), app.devices.audio_out.as_deref()) {
             Ok(handle) => {
                 app.voice = Some(handle);
                 let _ = net_tx.send(ClientMsg::VoiceJoin).await;
@@ -609,89 +790,47 @@ async fn do_switch(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, room: String
     }
 }
 
-// Byte offset of the char boundary just before `idx`.
-fn prev_char_boundary(s: &str, idx: usize) -> usize {
-    s[..idx].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
-}
-
-// Byte offset of the char boundary just after `idx`.
-fn next_char_boundary(s: &str, idx: usize) -> usize {
-    s[idx..].chars().next().map(|c| idx + c.len_utf8()).unwrap_or(idx)
-}
-
-// Row (0-based line) and column (0-based char) of `cursor` within `input`.
-fn cursor_rowcol(input: &str, cursor: usize) -> (usize, usize) {
-    let before = &input[..cursor];
-    let row = before.bytes().filter(|&b| b == b'\n').count();
-    let col = before.rsplit('\n').next().unwrap_or("").chars().count();
-    (row, col)
-}
-
-// Move the cursor up (dir = -1) or down (dir = 1) one line, keeping the column.
-fn move_cursor_vertical(input: &str, cursor: usize, dir: i32) -> usize {
-    let (row, col) = cursor_rowcol(input, cursor);
-    let lines: Vec<&str> = input.split('\n').collect();
-    let target = row as i32 + dir;
-    if target < 0 {
-        return 0;
-    }
-    if target as usize >= lines.len() {
-        return input.len();
-    }
-    let target = target as usize;
-    let mut offset = 0;
-    for l in &lines[..target] {
-        offset += l.len() + 1;
-    }
-    let line = lines[target];
-    let c = col.min(line.chars().count());
-    offset + line.char_indices().nth(c).map(|(i, _)| i).unwrap_or(line.len())
-}
+use self::commands::Command;
+use self::text::{cursor_rowcol, message_lines, move_cursor_vertical, next_char_boundary, prev_char_boundary};
 
 async fn handle_cmd(cmd: &str, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
-    let mut parts = cmd.splitn(2, ' ');
-    let verb = parts.next().unwrap_or("");
-    let arg = parts.next().map(str::trim);
-
-    match verb {
-        "join" | "j" => {
-            if let Some(room) = arg {
-                do_switch(app, net_tx, room.to_string()).await;
-            }
+    match Command::parse(cmd) {
+        Command::Join(room) => {
+            do_switch(app, net_tx, room).await;
         }
-        "create" | "new" => {
-            if let Some(name) = arg {
-                let _ = net_tx.send(ClientMsg::CreateRoom { name: name.to_string() }).await;
-            }
+        Command::Create(name) => {
+            let _ = net_tx.send(ClientMsg::CreateRoom { name }).await;
         }
-        "rooms" | "list" => {
+        Command::Rooms => {
             let _ = net_tx.send(ClientMsg::ListRooms).await;
         }
-        "theme" => {
-            if let Some(name) = arg {
-                app.theme = by_name(name);
-                let _ = Config::update_theme(name);
-                let room = app.current_room.clone();
-                app.push_sys(room, format!("theme → {}", app.theme.name));
-            } else {
-                let room = app.current_room.clone();
-                app.push_sys(
-                    room,
-                    format!(
-                        "themes: {}  (current: {})",
-                        crate::theme::ALL.join("  "),
-                        app.theme.name
-                    ),
-                );
-            }
+        Command::Theme(Some(name)) => {
+            app.theme = by_name(&name);
+            let _ = Config::update_theme(&name);
+            let room = app.current_room.clone();
+            app.push_sys(room, format!("theme → {}", app.theme.name));
         }
-        "share" => {
-            share_cmd(app, net_tx, arg).await;
+        Command::Theme(None) => {
+            let room = app.current_room.clone();
+            app.push_sys(
+                room,
+                format!(
+                    "themes: {}  (current: {})",
+                    crate::theme::ALL.join("  "),
+                    app.theme.name
+                ),
+            );
         }
-        "watch" => {
-            watch_cmd(app, arg);
+        Command::Share(kind) => {
+            share_cmd(app, net_tx, Some(kind)).await;
         }
-        "help" | "?" => {
+        Command::ShareStop => {
+            share_stop(app, net_tx).await;
+        }
+        Command::Watch(arg) => {
+            watch_cmd(app, arg.as_deref());
+        }
+        Command::Help => {
             let room = app.current_room.clone();
             for line in [
                 "commands: /join <room>  /create <room>  /rooms  /theme [name]  /help",
@@ -703,7 +842,7 @@ async fn handle_cmd(cmd: &str, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) 
                 app.push_sys(room.clone(), line.into());
             }
         }
-        _ => {
+        Command::Unknown(verb) => {
             let room = app.current_room.clone();
             app.push_sys(room, format!("unknown command /{verb} — try /help"));
         }
@@ -770,20 +909,13 @@ fn kill_share(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-async fn share_cmd(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, arg: Option<&str>) {
+async fn share_cmd(
+    app: &mut App,
+    net_tx: &mpsc::Sender<ClientMsg>,
+    kind: Option<crate::protocol::ShareKind>,
+) {
     let room = app.current_room.clone();
-
-    if arg == Some("stop") {
-        match app.share_child.take() {
-            Some(mut child) => {
-                kill_share(&mut child);
-                let _ = net_tx.send(ClientMsg::ShareStop).await;
-                app.push_sys(room, "stopped sharing".into());
-            }
-            None => app.push_sys(room, "not currently sharing".into()),
-        }
-        return;
-    }
+    let share_kind = kind.unwrap_or(crate::protocol::ShareKind::Screen);
 
     if app.share_child.is_some() {
         app.push_sys(room, "already sharing — /share stop first".into());
@@ -795,16 +927,31 @@ async fn share_cmd(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, arg: Option<
         return;
     };
 
-    let kind = arg.unwrap_or("screen");
-    let cmd = share_template(kind, app.video_device.as_deref()).replace("{addr}", &addr);
+    let kind_str = match share_kind {
+        crate::protocol::ShareKind::Cam => "cam",
+        crate::protocol::ShareKind::Screen => "screen",
+    };
+    let cmd = share_template(kind_str, app.devices.video_device.as_deref()).replace("{addr}", &addr);
     match spawn_detached(&cmd) {
         Ok(child) => {
             app.share_child = Some(child);
-            let _ = net_tx.send(ClientMsg::ShareStart { url: addr.clone() }).await;
+            let _ = net_tx.send(ClientMsg::ShareStart { kind: share_kind, url: addr.clone() }).await;
             let nick = app.nick.clone();
-            app.push_sys(room, format!("sharing {kind} at {addr} — peers: /watch {nick}"));
+            app.push_sys(room, format!("sharing {kind_str} at {addr} — peers: /watch {nick}"));
         }
         Err(e) => app.push_sys(room, format!("share error: {e}")),
+    }
+}
+
+async fn share_stop(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
+    let room = app.current_room.clone();
+    match app.share_child.take() {
+        Some(mut child) => {
+            kill_share(&mut child);
+            let _ = net_tx.send(ClientMsg::ShareStop { kind: None }).await;
+            app.push_sys(room, "stopped sharing".into());
+        }
+        None => app.push_sys(room, "not currently sharing".into()),
     }
 }
 
@@ -859,8 +1006,8 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             app.scroll.insert(app.current_room.clone(), 0);
         }
 
-        ServerMsg::Message { room, nick, content, ts } => {
-            app.push_msg(&room, ChatMessage { nick, content, ts });
+        ServerMsg::Message { room, msg_id, nick, content, ts } => {
+            app.push_msg(&room, ChatMessage { msg_id, nick, content, ts });
         }
 
         ServerMsg::UserJoined { room, nick, users } => {
@@ -899,14 +1046,14 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             }
         }
 
-        ServerMsg::ShareStarted { room, nick, url } => {
+        ServerMsg::ShareStarted { room, nick, kind: _, url } => {
             if nick != app.nick {
                 app.shares.insert(nick.clone(), url);
                 app.push_sys(room, format!("{nick} is sharing — /watch {nick} to view"));
             }
         }
 
-        ServerMsg::ShareStopped { room, nick } => {
+        ServerMsg::ShareStopped { room, nick, kind: _ } => {
             if nick != app.nick {
                 app.shares.remove(&nick);
                 app.push_sys(room, format!("{nick} stopped sharing"));
@@ -917,7 +1064,9 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             app.status = Some(format!("error: {msg}"));
         }
 
-        ServerMsg::Pong => {}
+        ServerMsg::Pong { .. } => {}
+        ServerMsg::Hello { .. } => {}
+        ServerMsg::History { .. } => {}
     }
 }
 
@@ -939,28 +1088,28 @@ fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    let [sidebar, messages_area] =
+    let [sidebar, center_area] =
         Layout::horizontal([Constraint::Length(22), Constraint::Min(1)]).areas(body);
+
+    let [composer_area, controls_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(22)]).areas(input_area);
 
     draw_active_bar(f, app, active_area);
     draw_rooms(f, app, sidebar);
-    draw_messages(f, app, messages_area);
-    draw_input(f, app, input_area);
+    draw_center(f, app, center_area);
+    draw_composer(f, app, composer_area);
+    draw_controls(f, app, controls_area);
     draw_hints(f, app, hints_area);
 
-    if app.focus == Focus::Settings {
+    if app.mode == Mode::Settings {
         draw_settings(f, app, area);
     }
 }
 
 fn draw_rooms(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
-    let focused = app.focus == Focus::Rooms;
-    let settings_focused = app.focus == Focus::Settings;
-
-    // Split: room list on top, settings button on bottom (3 lines for a bordered block)
-    let [list_area, btn_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
+    let focused = app.mode != Mode::Compose && app.pane == Pane::Rooms;
+    let active = app.mode == Mode::Pane && app.pane == Pane::Rooms;
 
     let items: Vec<ListItem> = app
         .rooms
@@ -968,7 +1117,7 @@ fn draw_rooms(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, room)| {
             let is_current = room == &app.current_room;
-            let is_cursor = focused && i == app.room_cursor;
+            let is_cursor = active && i == app.room_cursor;
             let prefix = if is_cursor { "> " } else { "  " };
             let text = format!("{prefix}#{room}");
             let style = match (is_current, is_cursor) {
@@ -997,35 +1146,77 @@ fn draw_rooms(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    f.render_widget(List::new(items).block(block), list_area);
+    f.render_widget(List::new(items).block(block), area);
+}
 
-    // Settings button
-    let btn_style = if settings_focused {
-        Style::default().fg(t.room_active).add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(t.room_inactive)
-    };
-    let btn_border = if settings_focused {
+fn draw_center(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme;
+    let focused = app.mode != Mode::Compose && app.pane == Pane::Center;
+
+    let border_style = if focused {
         Style::default().fg(t.border_focus)
     } else {
         Style::default().fg(t.border_dim)
     };
-    let btn_block = Block::default()
+
+    // Has anyone in the room got an active share? Used to badge the Stream tab.
+    let any_share = app
+        .room_users
+        .get(&app.current_room)
+        .map(|users| users.iter().any(|u| app.shares.contains_key(u)))
+        .unwrap_or(false);
+
+    let tab = |label: &str, active: bool| {
+        let style = if active {
+            Style::default().fg(t.border_focus).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(t.room_inactive)
+        };
+        Span::styled(format!(" {label} "), style)
+    };
+
+    let messages_tab = tab("Messages", app.center_tab == CenterTab::Messages);
+    let stream_label = if any_share { "Stream ●" } else { "Stream" };
+    let stream_tab = tab(stream_label, app.center_tab == CenterTab::Stream);
+
+    let scroll_label = {
+        let raw = app.current_scroll();
+        if raw > 0 { format!(" ↑{raw}") } else { String::new() }
+    };
+    let voice_label = app
+        .voice_users
+        .get(&app.current_room)
+        .filter(|u| !u.is_empty())
+        .map(|u| format!(" [mic {}] ", u.join(" ")))
+        .unwrap_or_default();
+    let title_room = Span::styled(
+        format!(" #{}{}{} ", app.current_room, voice_label, scroll_label),
+        Style::default().fg(t.border_focus).add_modifier(Modifier::BOLD),
+    );
+
+    let title_line = Line::from(vec![title_room, Span::raw("│"), messages_tab, stream_tab]);
+
+    let block = Block::default()
+        .title(title_line)
         .borders(Borders::ALL)
-        .border_style(btn_border);
-    let btn_text = Paragraph::new(Span::styled(" ⚙ settings", btn_style)).block(btn_block);
-    f.render_widget(btn_text, btn_area);
+        .border_style(border_style);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match app.center_tab {
+        CenterTab::Messages => draw_messages_body(f, app, inner),
+        CenterTab::Stream => draw_stream_body(f, app, inner),
+    }
 }
 
-fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_messages_body(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
-    // Borders::ALL trims one cell on each side.
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width as usize;
+    let inner_h = area.height as usize;
     app.msg_width = inner_w as u16;
     app.msg_height = inner_h as u16;
 
-    // Wrap every message into display lines up front so scrolling is exact.
     let lines: Vec<Line> = app
         .current_msgs()
         .iter()
@@ -1044,24 +1235,59 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let end = (start + inner_h).min(total);
     let visible: Vec<Line> = lines[start..end].to_vec();
 
-    let scroll_label = if scroll > 0 { format!(" ↑{scroll}") } else { String::new() };
-    let voice_label = app
-        .voice_users
+    f.render_widget(Paragraph::new(Text::from(visible)), area);
+}
+
+fn draw_stream_body(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme;
+    let sharers: Vec<String> = app
+        .room_users
         .get(&app.current_room)
-        .filter(|u| !u.is_empty())
-        .map(|u| format!(" [mic {}] ", u.join(" ")))
+        .map(|users| {
+            users
+                .iter()
+                .filter(|u| app.shares.contains_key(*u))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
-    let title = format!(" #{}{}{} ", app.current_room, voice_label, scroll_label);
 
-    let block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default().fg(t.border_focus).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.border_dim));
+    let lines: Vec<Line> = if sharers.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "no active streams",
+                Style::default().fg(t.hint_text),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "press the Share Screen or Share Cam button to start one",
+                Style::default().fg(t.room_inactive),
+            )),
+        ]
+    } else {
+        let mut out = vec![Line::from(Span::styled(
+            "active streams:",
+            Style::default().fg(t.hint_text).add_modifier(Modifier::BOLD),
+        ))];
+        for s in sharers {
+            out.push(Line::from(Span::styled(
+                format!("  ● {s}"),
+                Style::default().fg(t.msg_nick),
+            )));
+        }
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "(inline kitty graphics pending — Phase 3.2)",
+            Style::default().fg(t.room_inactive),
+        )));
+        out
+    };
 
-    f.render_widget(Paragraph::new(Text::from(visible)).block(block), area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn draw_active_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -1107,113 +1333,13 @@ fn draw_active_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// Wrap a message into styled display lines that each fit within `width`
-// columns. System messages (empty nick) are indented; chat messages keep a
-// `HH:MM nick:` header on the first line and indent continuation lines.
-// Explicit newlines in the content start a fresh wrapped segment.
-fn message_lines(m: &ChatMessage, width: usize, t: &Theme) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    if m.nick.is_empty() {
-        let avail = width.saturating_sub(2).max(1);
-        m.content
-            .split('\n')
-            .flat_map(|seg| wrap_words(seg, avail, avail))
-            .map(|chunk| {
-                Line::from(Span::styled(
-                    format!("  {chunk}"),
-                    Style::default().fg(t.msg_system),
-                ))
-            })
-            .collect()
-    } else {
-        let ts = Local
-            .timestamp_opt(m.ts, 0)
-            .single()
-            .map(|dt| dt.format("%H:%M").to_string())
-            .unwrap_or_else(|| "--:--".to_string());
-        let header_w = ts.chars().count() + 1 + m.nick.chars().count() + 2;
-        let first_avail = width.saturating_sub(header_w).max(1);
-        let cont_avail = width.saturating_sub(2).max(1);
-        let mut chunks: Vec<String> = Vec::new();
-        for (si, seg) in m.content.split('\n').enumerate() {
-            let first = if si == 0 { first_avail } else { cont_avail };
-            chunks.extend(wrap_words(seg, first, cont_avail));
-        }
-        chunks
-            .into_iter()
-            .enumerate()
-            .map(|(i, chunk)| {
-                if i == 0 {
-                    Line::from(vec![
-                        Span::styled(format!("{ts} "), Style::default().fg(t.msg_timestamp)),
-                        Span::styled(
-                            format!("{}: ", m.nick),
-                            Style::default().fg(t.msg_nick).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(chunk, Style::default().fg(t.msg_text)),
-                    ])
-                } else {
-                    Line::from(Span::styled(
-                        format!("  {chunk}"),
-                        Style::default().fg(t.msg_text),
-                    ))
-                }
-            })
-            .collect()
-    }
-}
-
-// Word-wrap `text` so the first line fits `first` columns and every following
-// line fits `rest`. Words longer than the limit are hard-split.
-fn wrap_words(text: &str, first: usize, rest: usize) -> Vec<String> {
-    let first = first.max(1);
-    let rest = rest.max(1);
-    let mut out: Vec<String> = Vec::new();
-    let mut line = String::new();
-    let mut line_len = 0usize;
-    let limit = |idx: usize| if idx == 0 { first } else { rest };
-
-    for word in text.split_whitespace() {
-        let cap = limit(out.len());
-        let wlen = word.chars().count();
-        let sep = if line_len == 0 { 0 } else { 1 };
-
-        if line_len + sep + wlen <= cap {
-            if sep == 1 {
-                line.push(' ');
-                line_len += 1;
-            }
-            line.push_str(word);
-            line_len += wlen;
-            continue;
-        }
-
-        if line_len > 0 {
-            out.push(std::mem::take(&mut line));
-        }
-
-        let mut chars: Vec<char> = word.chars().collect();
-        loop {
-            let cap = limit(out.len());
-            if chars.len() <= cap {
-                line_len = chars.len();
-                line = chars.into_iter().collect();
-                break;
-            }
-            let chunk: String = chars.drain(..cap).collect();
-            out.push(chunk);
-        }
-    }
-
-    if line_len > 0 || out.is_empty() {
-        out.push(line);
-    }
-    out
-}
-
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
-    let focused = app.focus == Focus::Input;
+    // Composer is "focused" any time we're typing into it (Compose mode) or the
+    // focus ring is on it in Select mode.
+    let focused = app.mode == Mode::Compose
+        || (app.mode != Mode::Settings && app.pane == Pane::Composer);
+    let cursor_visible = app.mode == Mode::Compose;
 
     let title = match &app.status {
         Some(s) => format!(" {s} "),
@@ -1253,7 +1379,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Paragraph::new(Text::from(display)).block(block), area);
 
-    if focused && inner_h > 0 {
+    if cursor_visible && inner_h > 0 {
         let inner = Rect {
             x: area.x + 1,
             y: area.y + 1,
@@ -1266,6 +1392,67 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
             f.set_cursor_position((cx, cy));
         }
     }
+}
+
+fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme;
+    let focused = app.mode != Mode::Compose && app.pane == Pane::Controls;
+    let active = app.mode == Mode::Pane && app.pane == Pane::Controls;
+
+    let voice_on = app.voice.is_some();
+    let share_on = app.share_child.is_some();
+
+    let lines: Vec<Line> = CONTROL_BUTTONS
+        .iter()
+        .enumerate()
+        .map(|(i, btn)| {
+            let (label, state) = match btn {
+                ControlButton::Voice => ("Voice       ", Some(voice_on)),
+                ControlButton::ShareScreen => ("Share Screen", Some(share_on)),
+                ControlButton::ShareCam => ("Share Cam   ", Some(share_on)),
+                ControlButton::Settings => ("Settings    ", None),
+            };
+            let is_cursor = active && i == app.controls_cursor;
+            let arrow = if is_cursor { "▶ " } else { "  " };
+            let state_str = match state {
+                Some(true) => "ON ",
+                Some(false) => "OFF",
+                None => "   ",
+            };
+            let label_style = if is_cursor {
+                Style::default().fg(t.room_active).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.msg_text)
+            };
+            let state_style = match state {
+                Some(true) => Style::default().fg(t.room_active).add_modifier(Modifier::BOLD),
+                Some(false) => Style::default().fg(t.room_inactive),
+                None => Style::default().fg(t.hint_text),
+            };
+            Line::from(vec![
+                Span::styled(arrow, Style::default().fg(t.border_focus)),
+                Span::styled(label, label_style),
+                Span::raw(" "),
+                Span::styled(state_str, state_style),
+            ])
+        })
+        .collect();
+
+    let border_style = if focused {
+        Style::default().fg(t.border_focus)
+    } else {
+        Style::default().fg(t.border_dim)
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            " controls ",
+            Style::default().fg(t.border_focus),
+        ))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 fn draw_splash(f: &mut Frame, theme: &Theme) {
@@ -1405,15 +1592,47 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme;
     let voice_hint = if app.voice.is_some() { "  v:mic-off" } else { "  v:voice" };
-    let text = match app.focus {
-        Focus::Input => {
-            format!(" tab:rooms  pgup/dn:scroll  shift+↵:newline  /help{voice_hint}  ^c:quit")
-        }
-        Focus::Rooms => " ↑↓:navigate  enter:join  esc:back  tab:settings".to_string(),
-        Focus::Settings => " ↑↓:navigate  ←→:change  tab/esc:save & close".to_string(),
+
+    let pane_label = |p: Pane| match p {
+        Pane::Rooms => "rooms",
+        Pane::Center => match app.center_tab {
+            CenterTab::Messages => "messages",
+            CenterTab::Stream => "stream",
+        },
+        Pane::Composer => "composer",
+        Pane::Controls => "controls",
     };
-    f.render_widget(
-        Paragraph::new(text.as_str()).style(Style::default().fg(t.hint_text)),
-        area,
-    );
+
+    let (mode_tag, hints) = match app.mode {
+        Mode::Compose => (
+            "[compose]".to_string(),
+            format!(" esc:select  shift+↵:newline  pgup/dn:scroll  /help{voice_hint}  ^c:quit"),
+        ),
+        Mode::Select => (
+            format!("[select: {}]", pane_label(app.pane)),
+            " ←→↑↓:move  enter:focus  esc:compose  ^c:quit".to_string(),
+        ),
+        Mode::Pane => {
+            let body = match app.pane {
+                Pane::Rooms => " ↑↓:browse  enter:join  esc:back",
+                Pane::Center => " ←→:switch tab  ↑↓:scroll  pgup/dn:page  esc:back",
+                Pane::Controls => " ↑↓:select  enter:toggle  esc:back",
+                Pane::Composer => " esc:back",
+            };
+            (format!("[pane: {}]", pane_label(app.pane)), body.to_string())
+        }
+        Mode::Settings => (
+            "[settings]".to_string(),
+            " ↑↓:navigate  ←→:change  tab/esc:save & close".to_string(),
+        ),
+    };
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {mode_tag} "),
+            Style::default().fg(t.border_focus).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(hints, Style::default().fg(t.hint_text)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
