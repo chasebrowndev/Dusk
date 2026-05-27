@@ -1,5 +1,8 @@
 mod commands;
+mod share_view;
 mod text;
+
+use share_view::ViewerHandle;
 
 use std::collections::HashMap;
 
@@ -232,8 +235,11 @@ struct App {
     voice: Option<VoiceHandle>,
     voice_users: HashMap<String, Vec<String>>, // room -> nicks in voice
     room_users: HashMap<String, Vec<String>>,  // room -> nicks present
-    share_child: Option<std::process::Child>,  // local capture process, if sharing
-    shares: HashMap<String, String>,           // nick -> stream addr of active shares
+    share_screen: Option<std::process::Child>, // local screen-capture process
+    share_cam: Option<std::process::Child>,    // local cam-capture process
+    shares: HashMap<String, Vec<(crate::protocol::ShareKind, String)>>, // nick -> active streams
+    inbound_views: HashMap<(String, crate::protocol::ShareKind), ViewerHandle>,
+    stream_rect: Option<Rect>,
     msg_width: u16,
     msg_height: u16,
     settings: SettingsState,
@@ -272,8 +278,11 @@ impl App {
             voice: None,
             voice_users: HashMap::new(),
             room_users: HashMap::new(),
-            share_child: None,
+            share_screen: None,
+            share_cam: None,
             shares: HashMap::new(),
+            inbound_views: HashMap::new(),
+            stream_rect: None,
             msg_width: 0,
             msg_height: 0,
             settings,
@@ -372,6 +381,7 @@ pub async fn run(
 
     while !quit {
         terminal.draw(|f| draw(f, &mut app))?;
+        paint_inline_shares(&app);
 
         tokio::select! {
             maybe_ev = events.next() => {
@@ -392,7 +402,10 @@ pub async fn run(
         }
     }
 
-    if let Some(mut child) = app.share_child.take() {
+    if let Some(mut child) = app.share_screen.take() {
+        kill_share(&mut child);
+    }
+    if let Some(mut child) = app.share_cam.take() {
         kill_share(&mut child);
     }
     if kbd_enhanced {
@@ -651,20 +664,21 @@ async fn handle_controls_pane_key(key: KeyEvent, app: &mut App, net_tx: &mpsc::S
 }
 
 async fn press_control(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>, btn: ControlButton) {
+    use crate::protocol::ShareKind;
     match btn {
         ControlButton::Voice => toggle_voice(app, net_tx).await,
         ControlButton::ShareScreen => {
-            if app.share_child.is_some() {
-                share_stop(app, net_tx).await;
+            if app.share_screen.is_some() {
+                share_stop(app, net_tx, Some(ShareKind::Screen)).await;
             } else {
-                share_cmd(app, net_tx, Some(crate::protocol::ShareKind::Screen)).await;
+                share_cmd(app, net_tx, Some(ShareKind::Screen)).await;
             }
         }
         ControlButton::ShareCam => {
-            if app.share_child.is_some() {
-                share_stop(app, net_tx).await;
+            if app.share_cam.is_some() {
+                share_stop(app, net_tx, Some(ShareKind::Cam)).await;
             } else {
-                share_cmd(app, net_tx, Some(crate::protocol::ShareKind::Cam)).await;
+                share_cmd(app, net_tx, Some(ShareKind::Cam)).await;
             }
         }
         ControlButton::Settings => {
@@ -825,7 +839,7 @@ async fn handle_cmd(cmd: &str, app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) 
             share_cmd(app, net_tx, Some(kind)).await;
         }
         Command::ShareStop => {
-            share_stop(app, net_tx).await;
+            share_stop(app, net_tx, None).await;
         }
         Command::Watch(arg) => {
             watch_cmd(app, arg.as_deref());
@@ -914,11 +928,17 @@ async fn share_cmd(
     net_tx: &mpsc::Sender<ClientMsg>,
     kind: Option<crate::protocol::ShareKind>,
 ) {
+    use crate::protocol::ShareKind;
     let room = app.current_room.clone();
-    let share_kind = kind.unwrap_or(crate::protocol::ShareKind::Screen);
+    let share_kind = kind.unwrap_or(ShareKind::Screen);
 
-    if app.share_child.is_some() {
-        app.push_sys(room, "already sharing — /share stop first".into());
+    let already = match share_kind {
+        ShareKind::Screen => app.share_screen.is_some(),
+        ShareKind::Cam => app.share_cam.is_some(),
+    };
+    if already {
+        let label = match share_kind { ShareKind::Screen => "screen", ShareKind::Cam => "cam" };
+        app.push_sys(room, format!("already sharing {label}"));
         return;
     }
 
@@ -926,41 +946,69 @@ async fn share_cmd(
         app.push_sys(room, "share: could not detect Tailscale IP".into());
         return;
     };
+    // Each kind binds its own port: screen on SHARE_PORT, cam on SHARE_PORT+1,
+    // so both tracks can run simultaneously without colliding.
+    let addr = match share_kind {
+        ShareKind::Screen => addr,
+        ShareKind::Cam => addr.rsplit_once(':').map(|(h, _)| format!("{h}:{}", SHARE_PORT + 1)).unwrap_or(addr),
+    };
 
     let kind_str = match share_kind {
-        crate::protocol::ShareKind::Cam => "cam",
-        crate::protocol::ShareKind::Screen => "screen",
+        ShareKind::Cam => "cam",
+        ShareKind::Screen => "screen",
     };
     let cmd = share_template(kind_str, app.devices.video_device.as_deref()).replace("{addr}", &addr);
     match spawn_detached(&cmd) {
         Ok(child) => {
-            app.share_child = Some(child);
+            match share_kind {
+                ShareKind::Screen => app.share_screen = Some(child),
+                ShareKind::Cam => app.share_cam = Some(child),
+            }
             let _ = net_tx.send(ClientMsg::ShareStart { kind: share_kind, url: addr.clone() }).await;
-            let nick = app.nick.clone();
-            app.push_sys(room, format!("sharing {kind_str} at {addr} — peers: /watch {nick}"));
+            app.push_sys(room, format!("sharing {kind_str} at {addr}"));
         }
         Err(e) => app.push_sys(room, format!("share error: {e}")),
     }
 }
 
-async fn share_stop(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
+async fn share_stop(
+    app: &mut App,
+    net_tx: &mpsc::Sender<ClientMsg>,
+    kind: Option<crate::protocol::ShareKind>,
+) {
+    use crate::protocol::ShareKind;
     let room = app.current_room.clone();
-    match app.share_child.take() {
-        Some(mut child) => {
+    let kinds: Vec<ShareKind> = match kind {
+        Some(k) => vec![k],
+        None => vec![ShareKind::Screen, ShareKind::Cam],
+    };
+    let mut stopped: Vec<&'static str> = Vec::new();
+    for k in &kinds {
+        let slot = match k { ShareKind::Screen => &mut app.share_screen, ShareKind::Cam => &mut app.share_cam };
+        if let Some(mut child) = slot.take() {
             kill_share(&mut child);
-            let _ = net_tx.send(ClientMsg::ShareStop { kind: None }).await;
-            app.push_sys(room, "stopped sharing".into());
+            stopped.push(match k { ShareKind::Screen => "screen", ShareKind::Cam => "cam" });
         }
-        None => app.push_sys(room, "not currently sharing".into()),
     }
+    if stopped.is_empty() {
+        app.push_sys(room, "not currently sharing".into());
+        return;
+    }
+    let _ = net_tx.send(ClientMsg::ShareStop { kind }).await;
+    app.push_sys(room, format!("stopped sharing {}", stopped.join(", ")));
 }
 
 fn watch_cmd(app: &mut App, arg: Option<&str>) {
     let room = app.current_room.clone();
 
-    let url = match arg {
-        Some(nick) => app.shares.get(nick).cloned(),
-        None if app.shares.len() == 1 => app.shares.values().next().cloned(),
+    // Pick first stream from the named (or only) sharer.
+    let url: Option<String> = match arg {
+        Some(nick) => app.shares.get(nick).and_then(|v| v.first().map(|(_, u)| u.clone())),
+        None if app.shares.len() == 1 => app
+            .shares
+            .values()
+            .next()
+            .and_then(|v| v.first().map(|(_, u)| u.clone())),
         None => None,
     };
 
@@ -1017,6 +1065,8 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
 
         ServerMsg::UserLeft { room, nick, users } => {
             app.room_users.insert(room.clone(), users);
+            app.shares.remove(&nick);
+            app.inbound_views.retain(|(n, _), _| n != &nick);
             app.push_sys(room, format!("← {nick} left"));
         }
 
@@ -1046,17 +1096,48 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             }
         }
 
-        ServerMsg::ShareStarted { room, nick, kind: _, url } => {
+        ServerMsg::ShareStarted { room, nick, kind, url } => {
             if nick != app.nick {
-                app.shares.insert(nick.clone(), url);
-                app.push_sys(room, format!("{nick} is sharing — /watch {nick} to view"));
+                let entry = app.shares.entry(nick.clone()).or_default();
+                entry.retain(|(k, _)| *k != kind);
+                entry.push((kind, url.clone()));
+                let label = match kind {
+                    crate::protocol::ShareKind::Screen => "screen",
+                    crate::protocol::ShareKind::Cam => "cam",
+                };
+                if room == app.current_room {
+                    app.center_tab = CenterTab::Stream;
+                }
+                if is_kitty() {
+                    if let Some(v) = ViewerHandle::spawn(url, kind) {
+                        app.inbound_views.insert((nick.clone(), kind), v);
+                    }
+                }
+                app.push_sys(room, format!("{nick} is sharing {label} — Stream tab"));
             }
         }
 
-        ServerMsg::ShareStopped { room, nick, kind: _ } => {
+        ServerMsg::ShareStopped { room, nick, kind } => {
             if nick != app.nick {
-                app.shares.remove(&nick);
-                app.push_sys(room, format!("{nick} stopped sharing"));
+                match kind {
+                    Some(k) => {
+                        if let Some(v) = app.shares.get_mut(&nick) {
+                            v.retain(|(kk, _)| *kk != k);
+                            if v.is_empty() { app.shares.remove(&nick); }
+                        }
+                        app.inbound_views.remove(&(nick.clone(), k));
+                    }
+                    None => {
+                        app.shares.remove(&nick);
+                        app.inbound_views.retain(|(n, _), _| n != &nick);
+                    }
+                }
+                let label = match kind {
+                    Some(crate::protocol::ShareKind::Screen) => "screen",
+                    Some(crate::protocol::ShareKind::Cam) => "cam",
+                    None => "stream",
+                };
+                app.push_sys(room, format!("{nick} stopped {label}"));
             }
         }
 
@@ -1205,7 +1286,10 @@ fn draw_center(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(block, area);
 
     match app.center_tab {
-        CenterTab::Messages => draw_messages_body(f, app, inner),
+        CenterTab::Messages => {
+            app.stream_rect = None;
+            draw_messages_body(f, app, inner);
+        }
         CenterTab::Stream => draw_stream_body(f, app, inner),
     }
 }
@@ -1238,16 +1322,20 @@ fn draw_messages_body(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(visible)), area);
 }
 
-fn draw_stream_body(f: &mut Frame, app: &App, area: Rect) {
+fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
+    app.stream_rect = Some(area);
     let t = app.theme;
-    let sharers: Vec<String> = app
+    let sharers: Vec<(String, Vec<crate::protocol::ShareKind>)> = app
         .room_users
         .get(&app.current_room)
         .map(|users| {
             users
                 .iter()
-                .filter(|u| app.shares.contains_key(*u))
-                .cloned()
+                .filter_map(|u| {
+                    app.shares
+                        .get(u)
+                        .map(|v| (u.clone(), v.iter().map(|(k, _)| *k).collect()))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1270,15 +1358,22 @@ fn draw_stream_body(f: &mut Frame, app: &App, area: Rect) {
             "active streams:",
             Style::default().fg(t.hint_text).add_modifier(Modifier::BOLD),
         ))];
-        for s in sharers {
+        for (s, kinds) in sharers {
+            let kind_str: Vec<&str> = kinds
+                .iter()
+                .map(|k| match k {
+                    crate::protocol::ShareKind::Screen => "screen",
+                    crate::protocol::ShareKind::Cam => "cam",
+                })
+                .collect();
             out.push(Line::from(Span::styled(
-                format!("  ● {s}"),
+                format!("  ● {s} — {}", kind_str.join(" + ")),
                 Style::default().fg(t.msg_nick),
             )));
         }
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
-            "(inline kitty graphics pending — Phase 3.2)",
+            if is_kitty() { "inline rendering active" } else { "use /watch <nick> to open viewer (non-kitty terminal)" },
             Style::default().fg(t.room_inactive),
         )));
         out
@@ -1288,6 +1383,42 @@ fn draw_stream_body(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
         area,
     );
+}
+
+fn is_kitty() -> bool {
+    std::env::var("TERM").map(|t| t == "xterm-kitty").unwrap_or(false)
+        || std::env::var("KITTY_WINDOW_ID").is_ok()
+}
+
+// After ratatui commits its frame, overlay the latest BMP frame from each
+// ViewerHandle onto the Stream pane via viuer (kitty graphics protocol).
+// Multiple streams stack vertically within `stream_rect`.
+fn paint_inline_shares(app: &App) {
+    if !matches!(app.center_tab, CenterTab::Stream) { return; }
+    if !is_kitty() { return; }
+    let Some(rect) = app.stream_rect else { return };
+    if app.inbound_views.is_empty() || rect.height < 4 || rect.width < 4 { return; }
+
+    let n = app.inbound_views.len() as u16;
+    let slot_h = rect.height / n;
+    if slot_h < 2 { return; }
+
+    for (i, ((_nick, _kind), handle)) in app.inbound_views.iter().enumerate() {
+        let img_opt = handle.frame.lock().ok().and_then(|g| g.clone());
+        let Some(img) = img_opt else { continue };
+        let cfg = viuer::Config {
+            x: rect.x,
+            y: (rect.y + slot_h * i as u16) as i16,
+            width: Some(rect.width as u32),
+            height: Some(slot_h as u32),
+            absolute_offset: true,
+            use_kitty: true,
+            use_iterm: false,
+            restore_cursor: true,
+            ..Default::default()
+        };
+        let _ = viuer::print(&img, &cfg);
+    }
 }
 
 fn draw_active_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -1400,7 +1531,8 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
     let active = app.mode == Mode::Pane && app.pane == Pane::Controls;
 
     let voice_on = app.voice.is_some();
-    let share_on = app.share_child.is_some();
+    let screen_on = app.share_screen.is_some();
+    let cam_on = app.share_cam.is_some();
 
     let lines: Vec<Line> = CONTROL_BUTTONS
         .iter()
@@ -1408,8 +1540,8 @@ fn draw_controls(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, btn)| {
             let (label, state) = match btn {
                 ControlButton::Voice => ("Voice       ", Some(voice_on)),
-                ControlButton::ShareScreen => ("Share Screen", Some(share_on)),
-                ControlButton::ShareCam => ("Share Cam   ", Some(share_on)),
+                ControlButton::ShareScreen => ("Share Screen", Some(screen_on)),
+                ControlButton::ShareCam => ("Share Cam   ", Some(cam_on)),
                 ControlButton::Settings => ("Settings    ", None),
             };
             let is_cursor = active && i == app.controls_cursor;
