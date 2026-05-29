@@ -31,6 +31,7 @@ struct State {
     rooms: HashMap<String, Room>,
     clients: HashMap<SocketAddr, Client>,
     voice: HashMap<String, Vec<SocketAddr>>, // room -> voice members
+    room_shares: HashMap<String, Vec<(String, ShareKind, String)>>, // room -> [(nick, kind, url)]
     store: Arc<Store>,
 }
 
@@ -42,6 +43,7 @@ impl State {
             rooms,
             clients: HashMap::new(),
             voice: HashMap::new(),
+            room_shares: HashMap::new(),
             store,
         }
     }
@@ -147,6 +149,25 @@ impl State {
             }
             r.warmed = true;
         }
+    }
+
+    fn add_share(&mut self, room: &str, nick: &str, kind: ShareKind, url: String) {
+        let v = self.room_shares.entry(room.to_string()).or_default();
+        v.retain(|(n, k, _)| !(n == nick && *k == kind));
+        v.push((nick.to_string(), kind, url));
+    }
+
+    fn remove_share(&mut self, room: &str, nick: &str, kind: Option<ShareKind>) {
+        if let Some(v) = self.room_shares.get_mut(room) {
+            match kind {
+                Some(k) => v.retain(|(n, kk, _)| !(n == nick && *kk == k)),
+                None => v.retain(|(n, _, _)| n != nick),
+            }
+        }
+    }
+
+    fn room_active_shares(&self, room: &str) -> Vec<(String, ShareKind, String)> {
+        self.room_shares.get(room).cloned().unwrap_or_default()
     }
 }
 
@@ -274,6 +295,16 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                 } else {
                     let _ = tx.send(ServerMsg::RoomList { rooms }).await;
                 }
+
+                // Replay any in-progress shares so late joiners see them.
+                let active_shares = {
+                    let s = state.lock().await;
+                    s.room_active_shares(&room)
+                };
+                for (share_nick, kind, url) in active_shares {
+                    let _ = tx.send(ServerMsg::ShareStarted { room: room.clone(), nick: share_nick, kind, url }).await;
+                }
+
                 info!("{nick} joined #{room}");
             }
 
@@ -336,6 +367,7 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                 {
                     let mut s = state.lock().await;
                     s.leave_room(&old_room, addr);
+                    s.remove_share(&old_room, &nick, None);
                     if let Some(c) = s.clients.get_mut(&addr) {
                         c.room = room.clone();
                     }
@@ -358,6 +390,15 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                 };
 
                 let _ = tx.send(ServerMsg::SwitchedRoom { room: room.clone(), history, users: new_users.clone() }).await;
+
+                // Replay in-progress shares for the new room.
+                let active_shares = {
+                    let s = state.lock().await;
+                    s.room_active_shares(&room)
+                };
+                for (share_nick, kind, url) in active_shares {
+                    let _ = tx.send(ServerMsg::ShareStarted { room: room.clone(), nick: share_nick, kind, url }).await;
+                }
 
                 let new_senders = {
                     let s = state.lock().await;
@@ -456,10 +497,11 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
 
             ClientMsg::ShareStart { kind, url } if joined => {
                 let (nick, room, senders) = {
-                    let s = state.lock().await;
+                    let mut s = state.lock().await;
                     let Some(c) = s.clients.get(&addr) else { continue };
                     let nick = c.nick.clone();
                     let room = c.room.clone();
+                    s.add_share(&room, &nick, kind, url.clone());
                     let senders = s.room_senders(&room, None);
                     (nick, room, senders)
                 };
@@ -473,10 +515,11 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
 
             ClientMsg::ShareStop { kind } if joined => {
                 let (nick, room, senders) = {
-                    let s = state.lock().await;
+                    let mut s = state.lock().await;
                     let Some(c) = s.clients.get(&addr) else { continue };
                     let nick = c.nick.clone();
                     let room = c.room.clone();
+                    s.remove_share(&room, &nick, kind);
                     let senders = s.room_senders(&room, None);
                     (nick, room, senders)
                 };
@@ -508,9 +551,12 @@ async fn disconnect(addr: SocketAddr, state: &Arc<Mutex<State>>) {
     let (nick, room) = {
         let mut s = state.lock().await;
         let Some(c) = s.clients.remove(&addr) else { return };
-        s.leave_room(&c.room, addr);
-        s.voice_leave(&c.room, addr);
-        (c.nick, c.room)
+        let nick = c.nick.clone();
+        let room = c.room.clone();
+        s.leave_room(&room, addr);
+        s.voice_leave(&room, addr);
+        s.remove_share(&room, &nick, None);
+        (nick, room)
     };
     let (senders, users) = {
         let s = state.lock().await;

@@ -9,6 +9,7 @@ use tokio::time::timeout;
 
 mod client;
 mod config;
+mod debug_log;
 mod protocol;
 mod server;
 mod store;

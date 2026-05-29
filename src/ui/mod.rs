@@ -48,13 +48,19 @@ const SPLASH_ART: &[&str] = &[
 
 // Screen/camera sharing: Dusk stays text-only and just signals peers, then
 // hands off to external capture/playback tools. The commands below are
-// overridable via the DUSK_SHARE_* environment variables; `{addr}` is
-// substituted with the sharer's `host:port`.
+// overridable via the DUSK_SHARE_* environment variables; `{addr}` is the
+// sharer's public Tailscale `host:port`, `{self_addr}` is the loopback the
+// sharer's own inline viewer connects to.
+//
+// We use ffmpeg's `tee` muxer to fan one encoded mpegts stream to both
+// endpoints. `use_fifo=1` gives each output its own buffer thread so a slow
+// or absent reader can't stall the encoder; `onfail=ignore` lets one output
+// die (peer disconnects) without tearing down the other (your self-view).
 const SHARE_PORT: u16 = 7668;
 const DEFAULT_SHARE_SCREEN: &str =
-    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -i pipe: -c copy -f mpegts -listen 1 tcp://{addr}";
+    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -i pipe: -c copy -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
 const DEFAULT_SHARE_CAM: &str =
-    "ffmpeg -loglevel warning -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 tcp://{addr}";
+    "ffmpeg -loglevel warning -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
 
 // Modal state machine (Phase 4).
@@ -145,6 +151,30 @@ struct SettingsState {
     theme_idx: usize,
 }
 
+/// cpal on Linux exposes every ALSA PCM, including rate-converter and channel-mix
+/// plugin stubs that aren't real endpoints. Picking one of these and trying to
+/// open it later blows up voice with "audio output not found: lavrate" or hangs.
+/// Keep names that ALSA reports but are known not to be usable out of the menu.
+fn is_real_alsa_device(name: &str) -> bool {
+    !matches!(
+        name,
+        "lavrate"
+            | "samplerate"
+            | "speexrate"
+            | "speexrate_best"
+            | "speexrate_medium"
+            | "upmix"
+            | "vdownmix"
+            | "null"
+            | "surround21"
+            | "surround40"
+            | "surround41"
+            | "surround50"
+            | "surround51"
+            | "surround71"
+    )
+}
+
 impl SettingsState {
     const NUM_ROWS: usize = 4;
 
@@ -154,7 +184,7 @@ impl SettingsState {
 
         let mut audio_inputs: Vec<String> = host
             .input_devices()
-            .map(|d| d.filter_map(|dev| dev.name().ok()).collect())
+            .map(|d| d.filter_map(|dev| dev.name().ok()).filter(|n| is_real_alsa_device(n)).collect())
             .unwrap_or_default();
         if audio_inputs.is_empty() {
             audio_inputs.push("(none)".into());
@@ -162,7 +192,7 @@ impl SettingsState {
 
         let mut audio_outputs: Vec<String> = host
             .output_devices()
-            .map(|d| d.filter_map(|dev| dev.name().ok()).collect())
+            .map(|d| d.filter_map(|dev| dev.name().ok()).filter(|n| is_real_alsa_device(n)).collect())
             .unwrap_or_default();
         if audio_outputs.is_empty() {
             audio_outputs.push("(none)".into());
@@ -241,6 +271,9 @@ struct App {
     share_cam: Option<std::process::Child>,    // local cam-capture process
     shares: HashMap<String, Vec<(crate::protocol::ShareKind, String)>>, // nick -> active streams
     inbound_views: HashMap<(String, crate::protocol::ShareKind), ViewerHandle>,
+    // Per-kind loopback addr the local self-view connects to. Set when we
+    // spawn a share, consumed when the server echoes ShareStarted back.
+    self_share_addr: HashMap<crate::protocol::ShareKind, String>,
     stream_rect: Option<Rect>,
     msg_width: u16,
     msg_height: u16,
@@ -284,6 +317,7 @@ impl App {
             share_cam: None,
             shares: HashMap::new(),
             inbound_views: HashMap::new(),
+            self_share_addr: HashMap::new(),
             stream_rect: None,
             msg_width: 0,
             msg_height: 0,
@@ -385,6 +419,7 @@ pub async fn run(
         terminal.draw(|f| draw(f, &mut app))?;
         paint_inline_shares(&app);
 
+        let has_views = !app.inbound_views.is_empty();
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
@@ -401,6 +436,7 @@ pub async fn run(
                     }
                 }
             }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)), if has_views => {}
         }
     }
 
@@ -958,28 +994,49 @@ async fn share_cmd(
         app.push_sys(room, "share: could not detect Tailscale IP".into());
         return;
     };
-    // Each kind binds its own port: screen on SHARE_PORT, cam on SHARE_PORT+1,
-    // so both tracks can run simultaneously without colliding.
-    let addr = match share_kind {
-        ShareKind::Screen => addr,
-        ShareKind::Cam => addr.rsplit_once(':').map(|(h, _)| format!("{h}:{}", SHARE_PORT + 1)).unwrap_or(addr),
+    // Port plan (one listener per output):
+    //   SHARE_PORT     — screen peer (public)
+    //   SHARE_PORT + 1 — cam peer    (public)
+    //   SHARE_PORT + 2 — screen self (loopback)
+    //   SHARE_PORT + 3 — cam self    (loopback)
+    let (addr, self_addr) = match share_kind {
+        ShareKind::Screen => (
+            addr.clone(),
+            format!("127.0.0.1:{}", SHARE_PORT + 2),
+        ),
+        ShareKind::Cam => (
+            addr.rsplit_once(':').map(|(h, _)| format!("{h}:{}", SHARE_PORT + 1)).unwrap_or(addr.clone()),
+            format!("127.0.0.1:{}", SHARE_PORT + 3),
+        ),
     };
 
     let kind_str = match share_kind {
         ShareKind::Cam => "cam",
         ShareKind::Screen => "screen",
     };
-    let cmd = share_template(kind_str, app.devices.video_device.as_deref()).replace("{addr}", &addr);
+    let cmd = share_template(kind_str, app.devices.video_device.as_deref())
+        .replace("{addr}", &addr)
+        .replace("{self_addr}", &self_addr);
+    crate::debug_log::log(format!(
+        "share[{kind_str}] spawn addr={addr} self_addr={self_addr} cmd=`{cmd}`"
+    ));
     match spawn_detached(&cmd) {
         Ok(child) => {
+            let pid = child.id();
+            crate::debug_log::log(format!("share[{kind_str}] pid={pid} spawned"));
             match share_kind {
                 ShareKind::Screen => app.share_screen = Some(child),
                 ShareKind::Cam => app.share_cam = Some(child),
             }
+            // Stash the loopback addr so ShareStarted can launch our self-view.
+            app.self_share_addr.insert(share_kind, self_addr.clone());
             let _ = net_tx.send(ClientMsg::ShareStart { kind: share_kind, url: addr.clone() }).await;
             app.push_sys(room, format!("sharing {kind_str} at {addr}"));
         }
-        Err(e) => app.push_sys(room, format!("share error: {e}")),
+        Err(e) => {
+            crate::debug_log::log(format!("share[{kind_str}] spawn err: {e}"));
+            app.push_sys(room, format!("share error: {e}"));
+        }
     }
 }
 
@@ -999,6 +1056,7 @@ async fn share_stop(
         let slot = match k { ShareKind::Screen => &mut app.share_screen, ShareKind::Cam => &mut app.share_cam };
         if let Some(mut child) = slot.take() {
             kill_share(&mut child);
+            app.self_share_addr.remove(k);
             stopped.push(match k { ShareKind::Screen => "screen", ShareKind::Cam => "cam" });
         }
     }
@@ -1110,8 +1168,9 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
 
         ServerMsg::ShareStarted { room, nick, kind, url } => {
             // Record the share for everyone (sharer included) so the Stream tab
-            // reflects reality. Skip spawning a viewer for our own share — that
-            // would race the real peer for ffmpeg's `-listen 1` socket.
+            // reflects reality. The sharer connects to a loopback that ffmpeg's
+            // `tee` muxer fans out alongside the public peer endpoint, so we
+            // never race the peer for a single `-listen 1` socket.
             let is_self = nick == app.nick;
             let entry = app.shares.entry(nick.clone()).or_default();
             entry.retain(|(k, _)| *k != kind);
@@ -1123,9 +1182,27 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             if room == app.current_room {
                 app.center_tab = CenterTab::Stream;
             }
-            if !is_self && is_kitty() {
-                if let Some(v) = ViewerHandle::spawn(url, kind) {
-                    app.inbound_views.insert((nick.clone(), kind), v);
+            crate::debug_log::log(format!(
+                "ShareStarted nick={nick} kind={label} url={url} is_self={is_self} kitty={}",
+                is_kitty()
+            ));
+            if is_kitty() {
+                let view_url = if is_self {
+                    app.self_share_addr.get(&kind).cloned()
+                } else {
+                    Some(url.clone())
+                };
+                if let Some(view_url) = view_url {
+                    crate::debug_log::log(format!(
+                        "viewer launch for {nick} ({label}) -> {view_url}"
+                    ));
+                    if let Some(v) = ViewerHandle::spawn(view_url, kind) {
+                        app.inbound_views.insert((nick.clone(), kind), v);
+                    }
+                } else if is_self {
+                    crate::debug_log::log(format!(
+                        "self ShareStarted but no self_share_addr stashed for {label}"
+                    ));
                 }
             }
             if !is_self {
@@ -1135,6 +1212,9 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
 
         ServerMsg::ShareStopped { room, nick, kind } => {
             let is_self = nick == app.nick;
+            crate::debug_log::log(format!(
+                "ShareStopped nick={nick} kind={kind:?} is_self={is_self}"
+            ));
             match kind {
                 Some(k) => {
                     if let Some(v) = app.shares.get_mut(&nick) {
@@ -1142,10 +1222,12 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
                         if v.is_empty() { app.shares.remove(&nick); }
                     }
                     app.inbound_views.remove(&(nick.clone(), k));
+                    if is_self { app.self_share_addr.remove(&k); }
                 }
                 None => {
                     app.shares.remove(&nick);
                     app.inbound_views.retain(|(n, _), _| n != &nick);
+                    if is_self { app.self_share_addr.clear(); }
                 }
             }
             if !is_self {
@@ -1390,12 +1472,14 @@ fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
             // self-share, or non-kitty terminal).
             let state: Vec<&str> = kinds
                 .iter()
-                .map(|k| match app.inbound_views.get(&(s.clone(), *k)) {
-                    Some(h) => match h.frame.lock().ok().and_then(|g| g.clone()) {
-                        Some(_) => "live",
-                        None => "connecting",
-                    },
-                    None => "off",
+                .map(|k| {
+                    match app.inbound_views.get(&(s.clone(), *k)) {
+                        Some(h) => match h.frame.lock().ok().map(|g| g.is_some()) {
+                            Some(true) => "live",
+                            _ => "connecting",
+                        },
+                        None => "off",
+                    }
                 })
                 .collect();
             out.push(Line::from(Span::styled(
@@ -1406,8 +1490,6 @@ fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
         out.push(Line::from(""));
         let hint = if !is_kitty() {
             "use /watch <nick> to open viewer (non-kitty terminal)"
-        } else if sharers.iter().any(|(n, _)| n == &app.nick) && sharers.len() == 1 {
-            "you are sharing — peer will see your stream inline"
         } else {
             "inline rendering: frames overlay this pane when [live]"
         };

@@ -26,24 +26,26 @@ pub fn start(
     use cpal::traits::DeviceTrait;
     let host = cpal::default_host();
 
-    let in_dev = match audio_in {
-        Some(name) => host
-            .input_devices()?
-            .find(|d| d.name().ok().as_deref() == Some(name))
-            .ok_or_else(|| anyhow::anyhow!("audio input not found: {name}"))?,
-        None => host
-            .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("no microphone found"))?,
-    };
-    let out_dev = match audio_out {
-        Some(name) => host
-            .output_devices()?
-            .find(|d| d.name().ok().as_deref() == Some(name))
-            .ok_or_else(|| anyhow::anyhow!("audio output not found: {name}"))?,
-        None => host
-            .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("no audio output found"))?,
-    };
+    // Saved names from prior runs may point at ALSA plugin stubs (lavrate,
+    // samplerate, …) or devices that have since disappeared. Treat them as
+    // hints: if the lookup misses, fall back to the host default rather than
+    // failing voice entirely.
+    let in_dev = audio_in
+        .and_then(|name| {
+            host.input_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(name)))
+        })
+        .or_else(|| host.default_input_device())
+        .ok_or_else(|| anyhow::anyhow!("no microphone found"))?;
+    let out_dev = audio_out
+        .and_then(|name| {
+            host.output_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(name)))
+        })
+        .or_else(|| host.default_output_device())
+        .ok_or_else(|| anyhow::anyhow!("no audio output found"))?;
 
     let cfg = cpal::StreamConfig {
         channels: 1,
