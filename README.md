@@ -19,18 +19,6 @@ Lightweight TUI chat over Tailscale. Single Rust binary — `dusk serve` for the
 
 ## Installation
 
-### Arch Linux
-
-```bash
-# From AUR (once submitted)
-yay -S dusk
-
-# Or build from source with makepkg
-git clone https://github.com/chasebrowndev/dusk
-cd dusk
-makepkg -si
-```
-
 ### From Source
 
 ```bash
