@@ -2,6 +2,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Client,
+    Host,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub nick: String,
@@ -10,6 +18,8 @@ pub struct Config {
     pub theme: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    #[serde(default)]
+    pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_input: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

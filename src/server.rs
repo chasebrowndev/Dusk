@@ -199,6 +199,9 @@ pub async fn run(bind: &str) -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("set_nodelay failed for {addr}: {e}");
+        }
         info!("connect {addr}");
         let state = state.clone();
         tokio::spawn(async move {

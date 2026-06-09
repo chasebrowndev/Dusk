@@ -1,3 +1,4 @@
+mod audio_routing;
 mod commands;
 mod share_view;
 mod text;
@@ -57,10 +58,15 @@ const SPLASH_ART: &[&str] = &[
 // or absent reader can't stall the encoder; `onfail=ignore` lets one output
 // die (peer disconnects) without tearing down the other (your self-view).
 const SHARE_PORT: u16 = 7668;
+// Captures the PipeWire sink monitor (desktop audio, no mic). Dusk's own
+// voice-chat output is isolated by AudioIsolation before this runs, so
+// viewers won't hear call audio echoed back. Override: DUSK_SHARE_SCREEN.
 const DEFAULT_SHARE_SCREEN: &str =
-    "wf-recorder -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -i pipe: -c copy -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
+    "wf-recorder {output_flag} -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -f pulse -i @DEFAULT_MONITOR@ -i pipe: -c:v copy -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
+// {audio_src} = configured audio-input device (mic). Cam shares are face-cam
+// style; voice goes through Dusk's own voice chat, so we capture mic here.
 const DEFAULT_SHARE_CAM: &str =
-    "ffmpeg -loglevel warning -f v4l2 -i /dev/video0 -vcodec libx264 -preset ultrafast -tune zerolatency -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
+    "ffmpeg -loglevel warning -f pulse -i {audio_src} -f v4l2 -i /dev/video0 -c:v libx264 -preset ultrafast -tune zerolatency -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
 
 // Modal state machine (Phase 4).
@@ -269,6 +275,7 @@ struct App {
     room_users: HashMap<String, Vec<String>>,  // room -> nicks present
     share_screen: Option<std::process::Child>, // local screen-capture process
     share_cam: Option<std::process::Child>,    // local cam-capture process
+    screen_audio: Option<audio_routing::AudioIsolation>, // Dusk sink isolation during screen share
     shares: HashMap<String, Vec<(crate::protocol::ShareKind, String)>>, // nick -> active streams
     inbound_views: HashMap<(String, crate::protocol::ShareKind), ViewerHandle>,
     // Per-kind loopback addr the local self-view connects to. Set when we
@@ -315,6 +322,7 @@ impl App {
             room_users: HashMap::new(),
             share_screen: None,
             share_cam: None,
+            screen_audio: None,
             shares: HashMap::new(),
             inbound_views: HashMap::new(),
             self_share_addr: HashMap::new(),
@@ -936,6 +944,30 @@ fn share_template(kind: &str, video_device: Option<&str>) -> String {
     }
 }
 
+// Query wf-recorder for the first available Wayland output and return
+// `--output <name>` ready for shell interpolation. Returns an empty string if
+// wf-recorder is unavailable or reports no outputs (env override still works).
+fn detect_wl_output() -> String {
+    let Ok(out) = std::process::Command::new("wf-recorder").arg("-L").output() else {
+        return String::new();
+    };
+    // Each line: "N. Name: <output> Description: ..."
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .and_then(|line| {
+            let mut words = line.split_whitespace();
+            while let Some(w) = words.next() {
+                if w == "Name:" {
+                    return words.next();
+                }
+            }
+            None
+        })
+        .map(|name| format!("--output {name}"))
+        .unwrap_or_default()
+}
+
 // Spawn a shell command detached from the TUI: no shared stdio, and in its own
 // process group so the whole pipeline can be signalled as a unit. stderr lands
 // in /tmp/dusk-share.log so a silent pipeline failure (wf-recorder missing
@@ -1014,12 +1046,22 @@ async fn share_cmd(
         ShareKind::Cam => "cam",
         ShareKind::Screen => "screen",
     };
+    let audio_src = app.devices.audio_in.as_deref().unwrap_or("default");
+    let output_flag = if share_kind == ShareKind::Screen { detect_wl_output() } else { String::new() };
     let cmd = share_template(kind_str, app.devices.video_device.as_deref())
         .replace("{addr}", &addr)
-        .replace("{self_addr}", &self_addr);
+        .replace("{self_addr}", &self_addr)
+        .replace("{audio_src}", audio_src)
+        .replace("{output_flag}", &output_flag);
     crate::debug_log::log(format!(
         "share[{kind_str}] spawn addr={addr} self_addr={self_addr} cmd=`{cmd}`"
     ));
+    // Isolate Dusk's own audio output from the monitor before capture starts
+    // so viewers don't hear call audio echoed back through the screen share.
+    if share_kind == ShareKind::Screen {
+        app.screen_audio = Some(audio_routing::AudioIsolation::setup());
+    }
+
     match spawn_detached(&cmd) {
         Ok(child) => {
             let pid = child.id();
@@ -1035,6 +1077,7 @@ async fn share_cmd(
         }
         Err(e) => {
             crate::debug_log::log(format!("share[{kind_str}] spawn err: {e}"));
+            app.screen_audio = None; // undo isolation if spawn failed
             app.push_sys(room, format!("share error: {e}"));
         }
     }
@@ -1057,6 +1100,9 @@ async fn share_stop(
         if let Some(mut child) = slot.take() {
             kill_share(&mut child);
             app.self_share_addr.remove(k);
+            if *k == ShareKind::Screen {
+                app.screen_audio = None; // Drop restores PipeWire routing
+            }
             stopped.push(match k { ShareKind::Screen => "screen", ShareKind::Cam => "cam" });
         }
     }
@@ -1482,16 +1528,18 @@ fn draw_stream_body(f: &mut Frame, app: &mut App, area: Rect) {
                     }
                 })
                 .collect();
-            out.push(Line::from(Span::styled(
-                format!("  ● {s} — {} [{}]", kind_str.join(" + "), state.join(" + ")),
-                Style::default().fg(t.msg_nick),
-            )));
+            let label = if s == &app.nick {
+                format!("  ● {s} (you) — {} [{}]", kind_str.join(" + "), state.join(" + "))
+            } else {
+                format!("  ● {s} — {} [{}]", kind_str.join(" + "), state.join(" + "))
+            };
+            out.push(Line::from(Span::styled(label, Style::default().fg(t.msg_nick))));
         }
         out.push(Line::from(""));
         let hint = if !is_kitty() {
-            "use /watch <nick> to open viewer (non-kitty terminal)"
+            "/watch <nick> to open external viewer  (audio included)"
         } else {
-            "inline rendering: frames overlay this pane when [live]"
+            "frames render here when [live]  ·  /watch <nick> for audio"
         };
         out.push(Line::from(Span::styled(
             hint,
@@ -1511,35 +1559,53 @@ fn is_kitty() -> bool {
         || std::env::var("KITTY_WINDOW_ID").is_ok()
 }
 
-// After ratatui commits its frame, overlay the latest BMP frame from each
-// ViewerHandle onto the Stream pane via viuer (kitty graphics protocol).
-// Multiple streams stack vertically within `stream_rect`.
+// After ratatui commits its frame, overlay decoded video frames onto the Stream
+// pane via the Kitty graphics protocol. Streams are arranged in a grid:
+//   1 → full pane   2 → side by side   4 → 2×2   6 → 3×2   9 → 3×3 …
 fn paint_inline_shares(app: &App) {
     if !matches!(app.center_tab, CenterTab::Stream) { return; }
     if !is_kitty() { return; }
     let Some(rect) = app.stream_rect else { return };
     if app.inbound_views.is_empty() || rect.height < 4 || rect.width < 4 { return; }
 
-    let n = app.inbound_views.len() as u16;
-    let slot_h = rect.height / n;
-    if slot_h < 2 { return; }
+    // Collect only views that already have a decoded frame.
+    let ready: Vec<image::DynamicImage> = app
+        .inbound_views
+        .values()
+        .filter_map(|h| h.frame.lock().ok().and_then(|g| g.clone()))
+        .collect();
+    if ready.is_empty() { return; }
 
-    for (i, ((_nick, _kind), handle)) in app.inbound_views.iter().enumerate() {
-        let img_opt = handle.frame.lock().ok().and_then(|g| g.clone());
-        let Some(img) = img_opt else { continue };
+    let (cols, rows) = grid_dims(ready.len());
+    let cell_w = rect.width / cols as u16;
+    let cell_h = rect.height / rows as u16;
+    if cell_w < 2 || cell_h < 2 { return; }
+
+    for (i, img) in ready.iter().enumerate() {
+        let col = (i % cols) as u16;
+        let row = (i / cols) as u16;
         let cfg = viuer::Config {
-            x: rect.x,
-            y: (rect.y + slot_h * i as u16) as i16,
-            width: Some(rect.width as u32),
-            height: Some(slot_h as u32),
+            x: rect.x + col * cell_w,
+            y: (rect.y + row * cell_h) as i16,
+            width: Some(cell_w as u32),
+            height: Some(cell_h as u32),
             absolute_offset: true,
             use_kitty: true,
             use_iterm: false,
             restore_cursor: true,
             ..Default::default()
         };
-        let _ = viuer::print(&img, &cfg);
+        let _ = viuer::print(img, &cfg);
     }
+}
+
+// Compute grid dimensions (cols, rows) for n streams.
+// Targets a roughly square layout: 1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-9→3×3 …
+fn grid_dims(n: usize) -> (usize, usize) {
+    if n <= 1 { return (1, 1); }
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = (n + cols - 1) / cols;
+    (cols, rows)
 }
 
 fn draw_active_bar(f: &mut Frame, app: &App, area: Rect) {

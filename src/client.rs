@@ -158,6 +158,9 @@ async fn connect_and_run(
             };
         }
     };
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("set_nodelay failed: {e}");
+    }
     let (read_half, write_half) = stream.into_split();
 
     info!("client connected to {server}");

@@ -16,8 +16,9 @@ mod store;
 mod theme;
 mod ui;
 mod voice;
+mod wizard;
 
-use config::{prompt_nick, Config};
+use config::{prompt_nick, Config, Role};
 use protocol::{ClientMsg, ServerMsg};
 
 const DISCOVERY_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -72,35 +73,48 @@ async fn main() -> Result<()> {
     // surface, so muzzle fd 2 before anything cpal/v4l-adjacent runs.
     silence_stderr();
 
+    // First run: no config file exists yet — launch the setup wizard.
+    if Config::load()?.is_none() && !cli.guest {
+        wizard::run().await?;
+    }
+
     let (nick, theme_name) = resolve_identity(&cli)?;
     match cli.command {
         Some(Command::Serve { bind }) => {
-            // Host mode: run the hub *and* a local TUI client. Tracing would
-            // clobber the alt-screen, so leave the global subscriber unset.
-            let port = bind.rsplit_once(':').map(|(_, p)| p.to_string()).unwrap_or_else(|| "7667".into());
-            let server_task = tokio::spawn(async move { server::run(&bind).await });
-            // Derive a localhost connect address from the bind string. 0.0.0.0
-            // and :: are special-cased; otherwise use the bind host verbatim.
-            let connect_addr = format!("127.0.0.1:{port}");
-            // Wait briefly for the listener to come up before connecting.
-            for _ in 0..20 {
-                if tokio::net::TcpStream::connect(&connect_addr).await.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let res = client::run(&connect_addr, &nick, &theme_name).await;
-            server_task.abort();
-            res
+            // Explicit `dusk serve` — host mode with custom bind.
+            run_as_host(&bind, &nick, &theme_name).await
         }
         None => {
-            let resolved = resolve_server(&cli).await?;
-            // TODO(handoff): pass resolved.discovery_summary into App initial
-            // state once the TUI agent exposes a status-overlay hook.
-            let _ = resolved.discovery_summary;
-            client::run(&resolved.addr, &nick, &theme_name).await
+            // Check saved role to decide whether this machine is a hub host.
+            let role = Config::load()?.map(|c| c.role).unwrap_or_default();
+            if role == Role::Host {
+                run_as_host("0.0.0.0:7667", &nick, &theme_name).await
+            } else {
+                let resolved = resolve_server(&cli).await?;
+                let _ = resolved.discovery_summary;
+                client::run(&resolved.addr, &nick, &theme_name).await
+            }
         }
     }
+}
+
+async fn run_as_host(bind: &str, nick: &str, theme_name: &str) -> Result<()> {
+    let port = bind
+        .rsplit_once(':')
+        .map(|(_, p)| p.to_string())
+        .unwrap_or_else(|| "7667".into());
+    let bind = bind.to_string();
+    let server_task = tokio::spawn(async move { server::run(&bind).await });
+    let connect_addr = format!("127.0.0.1:{port}");
+    for _ in 0..20 {
+        if tokio::net::TcpStream::connect(&connect_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let res = client::run(&connect_addr, nick, theme_name).await;
+    server_task.abort();
+    res
 }
 
 async fn resolve_server(cli: &Cli) -> Result<ResolvedServer> {
@@ -310,6 +324,7 @@ fn resolve_identity(cli: &Cli) -> Result<(String, String)> {
         machine_id: Config::machine_id(),
         theme: "cyberpunk".into(),
         server: None,
+        role: Role::default(),
         audio_input: None,
         audio_output: None,
         video_device: None,

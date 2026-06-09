@@ -31,8 +31,11 @@ impl ViewerHandle {
         // 480p @ 15fps BMP — small enough to decode in real time, big enough to read.
         // Default to `warning` so pipeline failures land in the log instead of /dev/null.
         let tpl = std::env::var("DUSK_VIEW_INLINE").unwrap_or_else(|_| {
+            // reconnect=1 + reconnect_streamed=1 make ffmpeg retry ECONNREFUSED
+            // so self-view and peer view work even if the encoder isn't listening yet.
             "ffmpeg -loglevel warning -fflags nobuffer -flags low_delay \
-             -i tcp://{addr}?timeout=10000000 -vf scale=640:-2,fps=15 -f image2pipe -vcodec bmp -"
+             -i tcp://{addr}?timeout=10000000&reconnect=1&reconnect_streamed=1&reconnect_delay_max=2 \
+             -vf scale=640:-2,fps=15 -an -f image2pipe -vcodec bmp -"
                 .into()
         });
         let cmd = tpl.replace("{addr}", &url);

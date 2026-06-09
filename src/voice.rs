@@ -50,12 +50,15 @@ pub fn start(
     let cfg = cpal::StreamConfig {
         channels: 1,
         sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Default,
+        // Fix buffer size to one Opus frame (20ms) to minimize capture latency.
+        // Default lets the OS choose, which is often 512–4096 samples (10–85ms).
+        buffer_size: cpal::BufferSize::Fixed(FRAME_SAMPLES as u32),
     };
 
     // ---- Capture ----
     // cpal callback -> std channel -> encoding thread -> blocking_send to net_tx
-    let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(32);
+    // Small channel: 4 frames = 80ms max queuing before backpressure.
+    let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
 
     let input_stream = in_dev.build_input_stream(
         &cfg,
@@ -79,22 +82,30 @@ pub fn start(
         let mut opus_out = vec![0u8; 512];
 
         loop {
-            match pcm_rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            // Drain all available PCM chunks into the accumulator without blocking,
+            // then sleep 1ms if we don't have a full frame yet. This avoids the
+            // 20ms worst-case latency of recv_timeout while not spinning the CPU.
+            match pcm_rx.try_recv() {
                 Ok(chunk) => {
                     acc.extend_from_slice(&chunk);
-                    while acc.len() >= FRAME_SAMPLES {
-                        for (i, &s) in acc[..FRAME_SAMPLES].iter().enumerate() {
-                            pcm_i16[i] = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        }
-                        acc.drain(..FRAME_SAMPLES);
-                        if let Ok(n) = encoder.encode(&pcm_i16, &mut opus_out) {
-                            let data = STANDARD.encode(&opus_out[..n]);
-                            let _ = net_tx.blocking_send(ClientMsg::VoiceData { data });
-                        }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if acc.len() < FRAME_SAMPLES {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            while acc.len() >= FRAME_SAMPLES {
+                for (i, &s) in acc[..FRAME_SAMPLES].iter().enumerate() {
+                    pcm_i16[i] = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                }
+                acc.drain(..FRAME_SAMPLES);
+                if let Ok(n) = encoder.encode(&pcm_i16, &mut opus_out) {
+                    let data = STANDARD.encode(&opus_out[..n]);
+                    let _ = net_tx.blocking_send(ClientMsg::VoiceData { data });
+                }
             }
         }
     });
@@ -119,8 +130,9 @@ pub fn start(
     input_stream.play()?;
     output_stream.play()?;
 
-    // Decoding thread: receives encoded frames, decodes, fills playback buffer
-    let (frame_in, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
+    // Decoding thread: receives encoded frames, decodes, fills playback buffer.
+    // Small channel: 4 frames = 80ms max queuing before backpressure.
+    let (frame_in, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
 
     std::thread::spawn(move || {
         let mut decoder = match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
