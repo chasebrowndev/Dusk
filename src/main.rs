@@ -68,15 +68,16 @@ pub struct ResolvedServer {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // First run: no config file exists yet — launch the setup wizard.
+    // stderr must be live here so any wizard error reaches the user.
+    if Config::load()?.is_none() && !cli.guest {
+        wizard::run().await?;
+    }
+
     // ALSA + libusb + a few graphics libs love to dump probe errors to stderr,
     // which scribbles over the ratatui alt-screen. The TUI is the only UX
     // surface, so muzzle fd 2 before anything cpal/v4l-adjacent runs.
     silence_stderr();
-
-    // First run: no config file exists yet — launch the setup wizard.
-    if Config::load()?.is_none() && !cli.guest {
-        wizard::run().await?;
-    }
 
     let (nick, theme_name) = resolve_identity(&cli)?;
     match cli.command {

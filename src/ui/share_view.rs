@@ -103,7 +103,7 @@ impl Drop for ViewerHandle {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(pid) = self.child_pid.take() {
             debug_log::log(format!("viewer[{:?}] pid={pid} dropped, killing", self.kind));
-            let _ = Command::new("kill").arg(format!("-{pid}")).status();
+            let _ = Command::new("kill").args(["--", &format!("-{pid}")]).status();
         }
     }
 }

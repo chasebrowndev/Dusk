@@ -12,7 +12,7 @@ use std::sync::Mutex;
 static LOCK: Mutex<()> = Mutex::new(());
 
 pub fn log(msg: impl std::fmt::Display) {
-    let _guard = LOCK.lock().ok();
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(mut f) = OpenOptions::new()
         .create(true)
         .append(true)

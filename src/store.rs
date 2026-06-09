@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use tracing::warn;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -131,7 +132,9 @@ fn worker(conn: Connection, rx: mpsc::Receiver<StoreCmd>) {
                             })
                         },
                     )?;
-                    let mut out: Vec<ChatMessage> = rows.filter_map(|r| r.ok()).collect();
+                    let mut out: Vec<ChatMessage> = rows
+                        .filter_map(|r| r.map_err(|e| warn!("store row: {e}")).ok())
+                        .collect();
                     out.reverse();
                     Ok(out)
                 })();
@@ -158,7 +161,9 @@ fn worker(conn: Connection, rx: mpsc::Receiver<StoreCmd>) {
                             })
                         },
                     )?;
-                    let out: Vec<ChatMessage> = rows.filter_map(|r| r.ok()).collect();
+                    let out: Vec<ChatMessage> = rows
+                        .filter_map(|r| r.map_err(|e| warn!("store row: {e}")).ok())
+                        .collect();
                     Ok(out)
                 })();
                 let _ = reply.send(res);

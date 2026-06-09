@@ -184,7 +184,9 @@ async fn warm_room(state: &Arc<Mutex<State>>, room: &str) {
     match store.fetch_recent(room, HISTORY_LIMIT).await {
         Ok(history) => {
             let mut s = state.lock().await;
-            s.set_warmed(room, history);
+            if !s.room_warmed(room) {
+                s.set_warmed(room, history);
+            }
         }
         Err(e) => warn!("warm {room}: {e}"),
     }
@@ -367,19 +369,30 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                     !s.rooms.contains_key(&room)
                 };
 
-                {
+                let old_shares = {
                     let mut s = state.lock().await;
+                    let shares = s.room_active_shares(&old_room)
+                        .into_iter()
+                        .filter(|(n, _, _)| n == &nick)
+                        .collect::<Vec<_>>();
                     s.leave_room(&old_room, addr);
                     s.remove_share(&old_room, &nick, None);
                     if let Some(c) = s.clients.get_mut(&addr) {
                         c.room = room.clone();
                     }
-                }
+                    shares
+                };
 
                 let (old_senders, old_users) = {
                     let s = state.lock().await;
                     (s.room_senders(&old_room, None), s.room_nicks(&old_room))
                 };
+                if !old_shares.is_empty() {
+                    let stop = ServerMsg::ShareStopped { room: old_room.clone(), nick: nick.clone(), kind: None };
+                    for s in &old_senders {
+                        let _ = s.send(stop.clone()).await;
+                    }
+                }
                 for s in old_senders {
                     let _ = s.send(ServerMsg::UserLeft { room: old_room.clone(), nick: nick.clone(), users: old_users.clone() }).await;
                 }
@@ -551,20 +564,27 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
 }
 
 async fn disconnect(addr: SocketAddr, state: &Arc<Mutex<State>>) {
-    let (nick, room) = {
+    let (nick, room, had_shares) = {
         let mut s = state.lock().await;
         let Some(c) = s.clients.remove(&addr) else { return };
         let nick = c.nick.clone();
         let room = c.room.clone();
         s.leave_room(&room, addr);
         s.voice_leave(&room, addr);
+        let had_shares = s.room_active_shares(&room).iter().any(|(n, _, _)| n == &nick);
         s.remove_share(&room, &nick, None);
-        (nick, room)
+        (nick, room, had_shares)
     };
     let (senders, users) = {
         let s = state.lock().await;
         (s.room_senders(&room, None), s.room_nicks(&room))
     };
+    if had_shares {
+        let stop = ServerMsg::ShareStopped { room: room.clone(), nick: nick.clone(), kind: None };
+        for s in &senders {
+            let _ = s.send(stop.clone()).await;
+        }
+    }
     for s in senders {
         let _ = s.send(ServerMsg::UserLeft { room: room.clone(), nick: nick.clone(), users: users.clone() }).await;
     }

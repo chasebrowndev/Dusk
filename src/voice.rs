@@ -79,27 +79,26 @@ pub fn start(
 
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
         let mut pcm_i16 = vec![0i16; FRAME_SAMPLES];
-        let mut opus_out = vec![0u8; 512];
+        let mut opus_out = vec![0u8; 1276]; // libopus minimum recommended size
 
         loop {
-            // Drain all available PCM chunks into the accumulator without blocking,
-            // then sleep 1ms if we don't have a full frame yet. This avoids the
-            // 20ms worst-case latency of recv_timeout while not spinning the CPU.
-            match pcm_rx.try_recv() {
-                Ok(chunk) => {
-                    acc.extend_from_slice(&chunk);
+            // Drain ALL available PCM chunks before encoding to keep the
+            // accumulator current. Sleep 1ms only when the channel is empty
+            // and we don't yet have a full frame.
+            loop {
+                match pcm_rx.try_recv() {
+                    Ok(chunk) => acc.extend_from_slice(&chunk),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if acc.len() < FRAME_SAMPLES {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        continue;
-                    }
-                }
+            }
+            if acc.len() < FRAME_SAMPLES {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
             while acc.len() >= FRAME_SAMPLES {
                 for (i, &s) in acc[..FRAME_SAMPLES].iter().enumerate() {
-                    pcm_i16[i] = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    pcm_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                 }
                 acc.drain(..FRAME_SAMPLES);
                 if let Ok(n) = encoder.encode(&pcm_i16, &mut opus_out) {

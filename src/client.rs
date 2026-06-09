@@ -255,9 +255,7 @@ async fn reader_task(
                     }
                 }
                 Err(e) => {
-                    warn!("bad server msg: {e}");
-                    let _ = done.send(format!("parse error: {e}")).await;
-                    return;
+                    warn!("bad server msg (skipping): {e}");
                 }
             },
         }

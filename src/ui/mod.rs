@@ -952,7 +952,7 @@ fn detect_wl_output() -> String {
         return String::new();
     };
     // Each line: "N. Name: <output> Description: ..."
-    String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&out.stderr)
         .lines()
         .next()
         .and_then(|line| {
@@ -996,8 +996,9 @@ fn spawn_detached(cmd: &str) -> std::io::Result<std::process::Child> {
 // signals the process group, catching piped children like ffmpeg).
 fn kill_share(child: &mut std::process::Child) {
     let pid = child.id();
+    // `--` prevents the negative PGID from being parsed as a signal flag.
     let _ = std::process::Command::new("kill")
-        .arg(format!("-{pid}"))
+        .args(["--", &format!("-{pid}")])
         .status();
     let _ = child.kill();
     let _ = child.wait();
@@ -1110,7 +1111,9 @@ async fn share_stop(
         app.push_sys(room, "not currently sharing".into());
         return;
     }
-    let _ = net_tx.send(ClientMsg::ShareStop { kind }).await;
+    // Send the precise kind(s) actually stopped so peers display the right label.
+    let stopped_kind = if kinds.len() == 1 { Some(kinds[0]) } else { kind };
+    let _ = net_tx.send(ClientMsg::ShareStop { kind: stopped_kind }).await;
     app.push_sys(room, format!("stopped sharing {}", stopped.join(", ")));
 }
 
