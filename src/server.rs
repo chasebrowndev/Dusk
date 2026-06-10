@@ -388,7 +388,8 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
                     (s.room_senders(&old_room, None), s.room_nicks(&old_room))
                 };
                 if !old_shares.is_empty() {
-                    let stop = ServerMsg::ShareStopped { room: old_room.clone(), nick: nick.clone(), kind: None };
+                    let kind = if old_shares.len() == 1 { Some(old_shares[0].1) } else { None };
+                    let stop = ServerMsg::ShareStopped { room: old_room.clone(), nick: nick.clone(), kind };
                     for s in &old_senders {
                         let _ = s.send(stop.clone()).await;
                     }
@@ -564,23 +565,28 @@ async fn handle(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<State>>) -
 }
 
 async fn disconnect(addr: SocketAddr, state: &Arc<Mutex<State>>) {
-    let (nick, room, had_shares) = {
+    let (nick, room, share_kinds) = {
         let mut s = state.lock().await;
         let Some(c) = s.clients.remove(&addr) else { return };
         let nick = c.nick.clone();
         let room = c.room.clone();
         s.leave_room(&room, addr);
         s.voice_leave(&room, addr);
-        let had_shares = s.room_active_shares(&room).iter().any(|(n, _, _)| n == &nick);
+        let share_kinds: Vec<ShareKind> = s.room_active_shares(&room)
+            .into_iter()
+            .filter(|(n, _, _)| n == &nick)
+            .map(|(_, k, _)| k)
+            .collect();
         s.remove_share(&room, &nick, None);
-        (nick, room, had_shares)
+        (nick, room, share_kinds)
     };
     let (senders, users) = {
         let s = state.lock().await;
         (s.room_senders(&room, None), s.room_nicks(&room))
     };
-    if had_shares {
-        let stop = ServerMsg::ShareStopped { room: room.clone(), nick: nick.clone(), kind: None };
+    if !share_kinds.is_empty() {
+        let kind = if share_kinds.len() == 1 { Some(share_kinds[0]) } else { None };
+        let stop = ServerMsg::ShareStopped { room: room.clone(), nick: nick.clone(), kind };
         for s in &senders {
             let _ = s.send(stop.clone()).await;
         }

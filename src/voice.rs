@@ -1,19 +1,22 @@
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cpal::traits::{HostTrait, StreamTrait};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::protocol::ClientMsg;
 
 const SAMPLE_RATE: u32 = 48000;
-const FRAME_SAMPLES: usize = 960; // 20ms at 48kHz
-const MAX_PLAY_SAMPLES: usize = SAMPLE_RATE as usize; // 1s jitter buffer cap
+const FRAME_SAMPLES: usize = 480; // 10ms at 48kHz
+// Hard ceiling per speaker: if a speaker's jitter buffer grows past this,
+// drop the oldest samples to stay current.
+const JITTER_MAX: usize = FRAME_SAMPLES * 4; // 40ms
 
 pub struct VoiceHandle {
-    /// Send base64-decoded Opus frames received from the server here to play them.
-    pub frame_in: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// Send (nick, base64-decoded Opus bytes) for each incoming VoiceFrame.
+    /// Each nick gets its own decoder and buffer; outputs are mixed at playback.
+    pub frame_in: std::sync::mpsc::SyncSender<(String, Vec<u8>)>,
     _input_stream: cpal::Stream,
     _output_stream: cpal::Stream,
 }
@@ -36,6 +39,16 @@ pub fn start(
                 .ok()
                 .and_then(|mut it| it.find(|d| d.name().ok().as_deref() == Some(name)))
         })
+        // Prefer any real mic over a monitor source. On PipeWire/ALSA, monitor
+        // sources (which capture playback) show up as input devices and cause echo
+        // if selected as the default. Fall back to the system default only if no
+        // non-monitor input exists.
+        .or_else(|| {
+            host.input_devices().ok()?.find(|d| {
+                let name = d.name().unwrap_or_default();
+                !name.to_lowercase().contains("monitor")
+            })
+        })
         .or_else(|| host.default_input_device())
         .ok_or_else(|| anyhow::anyhow!("no microphone found"))?;
     let out_dev = audio_out
@@ -50,15 +63,15 @@ pub fn start(
     let cfg = cpal::StreamConfig {
         channels: 1,
         sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        // Fix buffer size to one Opus frame (20ms) to minimize capture latency.
-        // Default lets the OS choose, which is often 512–4096 samples (10–85ms).
+        // Request one Opus frame per cpal callback (10ms). ALSA may not honor
+        // this exactly — the accumulator in the encoder handles misalignment.
         buffer_size: cpal::BufferSize::Fixed(FRAME_SAMPLES as u32),
     };
 
     // ---- Capture ----
-    // cpal callback -> std channel -> encoding thread -> blocking_send to net_tx
-    // Small channel: 4 frames = 80ms max queuing before backpressure.
-    let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    // cpal callback -> std channel -> encoding thread -> try_send to net_tx
+    // 2 frames of slack; if the encoder falls behind we drop rather than queue.
+    let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
 
     let input_stream = in_dev.build_input_stream(
         &cfg,
@@ -71,7 +84,8 @@ pub fn start(
 
     // Encoding thread (std::thread so opus::Encoder doesn't need Send)
     std::thread::spawn(move || {
-        let mut encoder = match opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip) {
+        // LowDelay minimises codec algorithmic latency (no lookahead).
+        let mut encoder = match opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::LowDelay) {
             Ok(e) => e,
             Err(e) => { eprintln!("opus encoder init: {e}"); return; }
         };
@@ -79,23 +93,22 @@ pub fn start(
 
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
         let mut pcm_i16 = vec![0i16; FRAME_SAMPLES];
-        let mut opus_out = vec![0u8; 1276]; // libopus minimum recommended size
+        let mut opus_out = vec![0u8; 1276];
 
         loop {
-            // Drain ALL available PCM chunks before encoding to keep the
-            // accumulator current. Sleep 1ms only when the channel is empty
-            // and we don't yet have a full frame.
-            loop {
-                match pcm_rx.try_recv() {
-                    Ok(chunk) => acc.extend_from_slice(&chunk),
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                }
+            // Block with a timeout so a stalled/unplugged device doesn't park
+            // this thread forever. On timeout there's nothing to encode; we
+            // just loop back and wait again.
+            match pcm_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(chunk) => acc.extend_from_slice(&chunk),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             }
-            if acc.len() < FRAME_SAMPLES {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
+            // Drain any additional chunks that arrived while we were encoding.
+            while let Ok(chunk) = pcm_rx.try_recv() {
+                acc.extend_from_slice(&chunk);
             }
+
             while acc.len() >= FRAME_SAMPLES {
                 for (i, &s) in acc[..FRAME_SAMPLES].iter().enumerate() {
                     pcm_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
@@ -103,23 +116,34 @@ pub fn start(
                 acc.drain(..FRAME_SAMPLES);
                 if let Ok(n) = encoder.encode(&pcm_i16, &mut opus_out) {
                     let data = STANDARD.encode(&opus_out[..n]);
-                    let _ = net_tx.blocking_send(ClientMsg::VoiceData { data });
+                    // Drop the frame if net is congested — stale audio is worse than a gap.
+                    let _ = net_tx.try_send(ClientMsg::VoiceData { data });
                 }
             }
         }
     });
 
     // ---- Playback ----
-    let play_buf: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let play_read = play_buf.clone();
-    let play_write = play_buf.clone();
+    // Per-speaker PCM queues. The output callback sums across all active
+    // speakers sample-by-sample (proper mixing), rather than interleaving
+    // their frames sequentially.
+    let mix_bufs: Arc<Mutex<HashMap<String, VecDeque<f32>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mix_read = mix_bufs.clone();
+    let mix_write = mix_bufs.clone();
 
     let output_stream = out_dev.build_output_stream(
         &cfg,
         move |data: &mut [f32], _| {
-            let mut buf = play_read.lock().unwrap();
+            let mut bufs = mix_read.lock().unwrap();
             for s in data.iter_mut() {
-                *s = buf.pop_front().unwrap_or(0.0);
+                let mut sum = 0.0f32;
+                for buf in bufs.values_mut() {
+                    sum += buf.pop_front().unwrap_or(0.0);
+                }
+                // Clamp after summing to prevent digital clipping when multiple
+                // speakers are simultaneously near full amplitude.
+                *s = sum.clamp(-1.0, 1.0);
             }
         },
         |e| eprintln!("playback error: {e}"),
@@ -129,27 +153,34 @@ pub fn start(
     input_stream.play()?;
     output_stream.play()?;
 
-    // Decoding thread: receives encoded frames, decodes, fills playback buffer.
-    // Small channel: 4 frames = 80ms max queuing before backpressure.
-    let (frame_in, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    // Decoding thread: one stateful Opus decoder per remote speaker, so that
+    // inter-frame prediction is never corrupted by interleaving streams.
+    // 2 frames of slack; extras are dropped by try_send in the UI event loop.
+    let (frame_in, frame_rx) = std::sync::mpsc::sync_channel::<(String, Vec<u8>)>(2);
 
     std::thread::spawn(move || {
-        let mut decoder = match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
-            Ok(d) => d,
-            Err(e) => { eprintln!("opus decoder init: {e}"); return; }
-        };
+        let mut decoders: HashMap<String, opus::Decoder> = HashMap::new();
+        let mut pcm_i16 = vec![0i16; FRAME_SAMPLES * 4];
 
-        let mut pcm_i16 = vec![0i16; FRAME_SAMPLES * 2];
+        while let Ok((nick, data)) = frame_rx.recv() {
+            let decoder = match decoders.entry(nick.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    match opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) {
+                        Ok(d) => e.insert(d),
+                        Err(err) => { eprintln!("opus decoder init for {nick}: {err}"); continue; }
+                    }
+                }
+            };
 
-        while let Ok(data) = frame_rx.recv() {
             if let Ok(n) = decoder.decode(&data, &mut pcm_i16, false) {
-                let samples: Vec<f32> = pcm_i16[..n]
-                    .iter()
-                    .map(|&s| s as f32 / 32767.0)
-                    .collect();
-                let mut buf = play_write.lock().unwrap();
-                if buf.len() < MAX_PLAY_SAMPLES {
-                    buf.extend(samples);
+                let samples = pcm_i16[..n].iter().map(|&s| s as f32 / 32767.0);
+                let mut bufs = mix_write.lock().unwrap();
+                let buf = bufs.entry(nick).or_default();
+                buf.extend(samples);
+                if buf.len() > JITTER_MAX {
+                    let excess = buf.len() - JITTER_MAX;
+                    buf.drain(..excess);
                 }
             }
         }

@@ -62,11 +62,11 @@ const SHARE_PORT: u16 = 7668;
 // voice-chat output is isolated by AudioIsolation before this runs, so
 // viewers won't hear call audio echoed back. Override: DUSK_SHARE_SCREEN.
 const DEFAULT_SHARE_SCREEN: &str =
-    "wf-recorder {output_flag} -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -f pulse -i @DEFAULT_MONITOR@ -i pipe: -c:v copy -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
+    "wf-recorder {output_flag} -c libx264 -x yuv420p -F mpegts -f - | ffmpeg -loglevel warning -f pulse -i @DEFAULT_MONITOR@ -i pipe: -map 1:v -map 0:a -c:v copy -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
 // {audio_src} = configured audio-input device (mic). Cam shares are face-cam
 // style; voice goes through Dusk's own voice chat, so we capture mic here.
 const DEFAULT_SHARE_CAM: &str =
-    "ffmpeg -loglevel warning -f pulse -i {audio_src} -f v4l2 -i /dev/video0 -c:v libx264 -preset ultrafast -tune zerolatency -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
+    "ffmpeg -loglevel warning -f pulse -i {audio_src} -f v4l2 -i /dev/video0 -map 0:a -map 1:v -c:v libx264 -preset ultrafast -tune zerolatency -c:a aac -b:a 128k -f tee \"[f=mpegts:use_fifo=1:onfail=ignore]tcp://{addr}?listen=1|[f=mpegts:use_fifo=1:onfail=ignore]tcp://{self_addr}?listen=1\"";
 const DEFAULT_SHARE_VIEW: &str = "ffplay -loglevel quiet -fflags nobuffer -flags low_delay -i tcp://{addr}";
 
 // Modal state machine (Phase 4).
@@ -276,6 +276,7 @@ struct App {
     share_screen: Option<std::process::Child>, // local screen-capture process
     share_cam: Option<std::process::Child>,    // local cam-capture process
     screen_audio: Option<audio_routing::AudioIsolation>, // Dusk sink isolation during screen share
+    voice_audio: Option<audio_routing::AudioIsolation>,  // Dusk sink isolation during voice (prevents monitor loopback echo)
     shares: HashMap<String, Vec<(crate::protocol::ShareKind, String)>>, // nick -> active streams
     inbound_views: HashMap<(String, crate::protocol::ShareKind), ViewerHandle>,
     // Per-kind loopback addr the local self-view connects to. Set when we
@@ -323,6 +324,7 @@ impl App {
             share_screen: None,
             share_cam: None,
             screen_audio: None,
+            voice_audio: None,
             shares: HashMap::new(),
             inbound_views: HashMap::new(),
             self_share_addr: HashMap::new(),
@@ -825,6 +827,7 @@ async fn apply_settings(app: &mut App) {
 async fn toggle_voice(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
     if app.voice.is_some() {
         app.voice = None;
+        app.voice_audio = None; // restores PipeWire routing via Drop
         let _ = net_tx.send(ClientMsg::VoiceLeave).await;
         let room = app.current_room.clone();
         app.push_sys(room, "left voice".into());
@@ -832,6 +835,11 @@ async fn toggle_voice(app: &mut App, net_tx: &mpsc::Sender<ClientMsg>) {
         match crate::voice::start(net_tx.clone(), app.devices.audio_in.as_deref(), app.devices.audio_out.as_deref()) {
             Ok(handle) => {
                 app.voice = Some(handle);
+                // Isolate AFTER cpal opens its output stream so that pactl can
+                // find and move the newly registered Dusk sink input to the null
+                // sink. Running setup() before start() means no sink inputs exist
+                // yet and isolation silently does nothing.
+                app.voice_audio = Some(audio_routing::AudioIsolation::setup());
                 let _ = net_tx.send(ClientMsg::VoiceJoin).await;
                 let room = app.current_room.clone();
                 app.push_sys(room, "joined voice — mic active".into());
@@ -952,7 +960,7 @@ fn detect_wl_output() -> String {
         return String::new();
     };
     // Each line: "N. Name: <output> Description: ..."
-    String::from_utf8_lossy(&out.stderr)
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
         .and_then(|line| {
@@ -1207,10 +1215,10 @@ fn handle_srv(msg: ServerMsg, app: &mut App) {
             }
         }
 
-        ServerMsg::VoiceFrame { data, .. } => {
+        ServerMsg::VoiceFrame { nick, data } => {
             if let Some(ref v) = app.voice {
                 if let Ok(bytes) = STANDARD.decode(&data) {
-                    let _ = v.frame_in.try_send(bytes);
+                    let _ = v.frame_in.try_send((nick, bytes));
                 }
             }
         }
